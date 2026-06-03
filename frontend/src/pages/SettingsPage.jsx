@@ -100,6 +100,14 @@ export default function SettingsPage() {
   const [userLoading,    setUserLoading]            = useState(false)
   const [userError,      setUserError]              = useState('')
 
+  const [editingId,      setEditingId]              = useState(null)
+  const [editForm,       setEditForm]               = useState({
+    display_name: '',
+    base_url: '',
+    project_key: '',
+    token: '',
+  })
+
   const isAdmin = user?.role === 'admin'
 
   const fetchConnections = () => {
@@ -149,6 +157,38 @@ export default function SettingsPage() {
       fetchConnections()
     } catch (err) {
       alert('Failed to remove: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
+  const handleEditClick = (connector) => {
+    setEditingId(connector.source_id)
+    setEditForm({
+      display_name: connector.display_name || '',
+      base_url: connector.base_url || '',
+      project_key: connector.project_key || '',
+      token: '',
+    })
+  }
+
+  const handleEditSave = async (source_id) => {
+    try {
+      const authToken = localStorage.getItem('hpe_token')
+      const response = await fetch(`/settings/connections/${source_id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(editForm),
+      })
+      if (response.ok) {
+        setEditingId(null)
+        fetchConnections()
+      } else {
+        alert('Failed to update connection')
+      }
+    } catch (err) {
+      alert('Error updating connection')
     }
   }
 
@@ -350,6 +390,12 @@ export default function SettingsPage() {
                         {isLoading ? '⟳ Testing…' : 'Test'}
                       </button>
                       <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => handleEditClick(conn)}
+                      >
+                        Edit
+                      </button>
+                      <button
                         className="btn btn-sm"
                         style={{ border: '1px solid var(--red-bd)', color: 'var(--red)', background: 'transparent' }}
                         onClick={() => handleRemove(conn.source_id)}
@@ -365,6 +411,47 @@ export default function SettingsPage() {
                       fontFamily: 'JetBrains Mono, monospace',
                     }}>
                       {testRes.status === 'ok' ? `✓ ${testRes.message}` : `✗ ${testRes.message}`}
+                    </div>
+                  )}
+                  {editingId === conn.source_id && (
+                    <div style={{
+                      marginTop: 10, padding: 12,
+                      background: 'var(--bg)', border: '1px solid var(--border)',
+                      borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 8,
+                    }}>
+                      <div>
+                        <label className="form-label" style={{ fontSize: 11 }}>Display Name</label>
+                        <input className="form-input" style={{ width: '100%' }}
+                          value={editForm.display_name}
+                          onChange={e => setEditForm({ ...editForm, display_name: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="form-label" style={{ fontSize: 11 }}>Base URL</label>
+                        <input className="form-input" style={{ width: '100%' }}
+                          value={editForm.base_url}
+                          onChange={e => setEditForm({ ...editForm, base_url: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="form-label" style={{ fontSize: 11 }}>Project Key</label>
+                        <input className="form-input" style={{ width: '100%' }}
+                          value={editForm.project_key}
+                          onChange={e => setEditForm({ ...editForm, project_key: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="form-label" style={{ fontSize: 11 }}>New Token (leave blank to keep existing)</label>
+                        <input className="form-input" style={{ width: '100%' }} type="password"
+                          placeholder="Leave blank to keep existing token"
+                          value={editForm.token}
+                          onChange={e => setEditForm({ ...editForm, token: e.target.value })} />
+                      </div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button className="btn btn-teal btn-sm" onClick={() => handleEditSave(conn.source_id)}>
+                          Save Changes
+                        </button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setEditingId(null)}>
+                          Cancel
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
