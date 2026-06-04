@@ -135,6 +135,16 @@ class TaskOrchestrator:
             })
             await delete_pipeline_context(db, case_id)
 
+        # Invalidate bug list cache after triage completes so
+        # the next GET /bugs reflects the new triage_info.
+        try:
+            _r = await get_redis()
+            _keys = await _r.keys("bug_list:*")
+            if _keys:
+                await _r.delete(*_keys)
+        except Exception:
+            pass  # cache invalidation must never crash the pipeline
+
     async def _checkpoint(self, case_id: str, step: str, context: dict) -> None:
         try:
             async with AsyncSessionLocal() as db:

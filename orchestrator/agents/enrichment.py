@@ -148,29 +148,27 @@ class EnrichmentAgent(BaseAgent):
         log.info("Enrichment initial query",
                  query=initial_query)
 
-        kb_articles  = []
-        so_articles  = []
+        kb_articles = []
 
-        # Run Confluence ReAct + Stack Overflow in parallel
-        confluence_task = asyncio.create_task(
-            self._run_react_loop(
-                title, component, description,
-                error_excerpt, initial_query,
-                target_space, groq_api_key,
-                enrichment_model))
-
-        so_task = asyncio.create_task(
-            self._search_stackoverflow(
-                initial_query, title))
-
-        conf_result, so_result = await asyncio.gather(
-            confluence_task, so_task,
-            return_exceptions=True)
+        # ReAct loop: iteration 0 runs Confluence + SO in
+        # parallel internally; iterations 1+ refine via LLM
+        self._iter0_so_results = []
+        conf_result = await self._run_react_loop(
+            title, component, description,
+            error_excerpt, initial_query,
+            target_space, groq_api_key,
+            enrichment_model)
 
         if isinstance(conf_result, list):
             kb_articles = conf_result
-        if isinstance(so_result, list):
-            so_articles = so_result
+
+        so_articles = self._iter0_so_results
+
+        # Tag every item with its source
+        for item in kb_articles:
+            item.setdefault("source", "confluence")
+        for item in so_articles:
+            item.setdefault("source", "stackoverflow")
 
         # Merge: confluence first then Stack Overflow
         all_articles = kb_articles + so_articles
@@ -179,7 +177,8 @@ class EnrichmentAgent(BaseAgent):
                  stackoverflow=len(so_articles),
                  total=len(all_articles))
 
-        context["kb_articles"] = all_articles[:6]
+        context["kb_articles"]        = all_articles[:6]
+        context["enrichment_sources"] = all_articles
         return context
 
     async def _run_react_loop(
@@ -210,7 +209,7 @@ class EnrichmentAgent(BaseAgent):
         for iteration in range(MAX_REACT_ITERS):
             try:
                 # Iteration 0: deterministic initial search,
-                # bypass LLM to eliminate one round-trip
+                # run Confluence + Stack Overflow in parallel
                 if iteration == 0:
                     query = initial_query
                     messages.append({
@@ -221,8 +220,29 @@ class EnrichmentAgent(BaseAgent):
                             f"Action: search_confluence\n"
                             f"Action Input: {query}"),
                     })
-                    results = await self._search_confluence(
-                        query, target_space)
+                    conf_r, so_r = await asyncio.gather(
+                        self._search_confluence(
+                            query, target_space),
+                        self._fetch_stack_overflow(query),
+                        return_exceptions=True,
+                    )
+                    if isinstance(conf_r, Exception):
+                        log.warning(
+                            "Confluence failed on iteration 0",
+                            error=str(conf_r))
+                        conf_r = []
+                    if isinstance(so_r, Exception):
+                        log.warning(
+                            "StackOverflow failed on iteration 0",
+                            error=str(so_r))
+                        so_r = []
+                    # Tag sources explicitly
+                    for item in conf_r:
+                        item["source"] = "confluence"
+                    for item in so_r:
+                        item["source"] = "stackoverflow"
+                    self._iter0_so_results = so_r
+                    results = conf_r
                     if not results:
                         obs = (
                             f"No results for '{query}' in "
@@ -358,6 +378,53 @@ class EnrichmentAgent(BaseAgent):
         except Exception as e:
             log.warning("Confluence error",
                         error=str(e))
+            return []
+
+    async def _fetch_stack_overflow(self,
+                                     query: str,
+                                     max_results: int = 5
+                                     ) -> list[dict]:
+        try:
+            url    = "https://api.stackexchange.com/2.3/search/advanced"
+            params = {
+                "q":        query,
+                "site":     "stackoverflow",
+                "pagesize": max_results,
+                "order":    "desc",
+                "sort":     "relevance",
+                "filter":   "withbody",
+            }
+            async with httpx.AsyncClient(
+                    timeout=5,
+                    follow_redirects=True) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    log.warning("StackOverflow advanced search failed",
+                                status=resp.status_code,
+                                query=query)
+                    return []
+                items   = resp.json().get("items", [])
+                results = []
+                for item in items:
+                    if item.get("answer_count", 0) < 1:
+                        continue
+                    body    = item.get("body", "")
+                    excerpt = re.sub(r'<[^>]+>', '', body)[:300]
+                    results.append({
+                        "title":        item.get("title", ""),
+                        "url":          item.get("link", ""),
+                        "score":        item.get("score", 0),
+                        "answer_count": item.get(
+                            "answer_count", 0),
+                        "excerpt":      excerpt,
+                        "source":       "stackoverflow",
+                    })
+                log.info("StackOverflow advanced search",
+                         query=query, count=len(results))
+                return results[:max_results]
+        except Exception as e:
+            log.warning("StackOverflow advanced search error",
+                        query=query, error=str(e))
             return []
 
     async def _search_stackoverflow(
