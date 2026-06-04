@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react'
 import { useAuth } from '../context/AuthContext'
-import { getConnections, addConnection, removeConnection, testConnection, listUsers, createUser, deleteUser } from '../api/settings'
+import { getConnections, addConnection, updateConnection, removeConnection, testConnection, listUsers, createUser, deleteUser } from '../api/settings'
 
 const SYSTEM_TYPES = [
+  { value: 'jira',        label: 'JIRA' },
   { value: 'github',      label: 'GitHub Issues' },
   { value: 'jira_apache', label: 'Apache JIRA' },
   { value: 'bugzilla',    label: 'Bugzilla' },
   { value: 'confluence',  label: 'Confluence' },
+  { value: 'customer_portal', label: 'Customer Portal' },
+  { value: 'support_kb',  label: 'Support KB' },
 ]
 
 const BASE_URL_DEFAULTS = {
@@ -14,6 +17,8 @@ const BASE_URL_DEFAULTS = {
   jira_apache: 'https://issues.apache.org/jira',
   bugzilla:    'https://bugzilla.mozilla.org',
   confluence:  'https://cwiki.apache.org/confluence',
+  customer_portal: 'http://localhost:8000/mock/customer-portal',
+  support_kb:  'https://cpp3-hpe.atlassian.net/wiki',
 }
 
 const ICON_COLORS = {
@@ -22,15 +27,18 @@ const ICON_COLORS = {
   bugzilla:        { bg: '#D97706', text: '#fff' },
   confluence:      { bg: '#0A7C6E', text: '#fff' },
   customer_portal: { bg: '#166534', text: '#fff' },
+  support_kb:      { bg: '#0A7C6E', text: '#fff' },
 }
 
 const FILTER_OPTIONS = [
   { key: 'all',             label: 'All Systems',       typeKey: null },
+  { key: 'jira',            label: 'JIRA',              typeKey: 'jira' },
   { key: 'github',          label: 'GitHub',            typeKey: 'github' },
   { key: 'jira_apache',     label: 'Apache JIRA',       typeKey: 'jira_apache' },
   { key: 'bugzilla',        label: 'Bugzilla',          typeKey: 'bugzilla' },
   { key: 'confluence',      label: 'Confluence',        typeKey: 'confluence' },
   { key: 'customer_portal', label: 'Customer Portal',   typeKey: 'customer_portal' },
+  { key: 'support_kb',      label: 'Support KB',        typeKey: 'support_kb' },
 ]
 
 const ROLE_COLORS = { admin: '#B91C1C', engineer: '#1A56A0', customer: '#D97706', executive: '#166534' }
@@ -39,6 +47,7 @@ const EMPTY_FORM = {
   display_name: '',
   system_type: 'github',
   base_url: BASE_URL_DEFAULTS.github,
+  auth_type: 'bearer_token',
   auth_token: '',
   project_key: '',
   ticket_prefix: '',
@@ -58,8 +67,8 @@ function Dot({ color }) {
 function StatusIndicator({ conn }) {
   if (!conn.enabled)
     return <span style={{ display: 'flex', alignItems: 'center', fontSize: 12, color: 'var(--text3)' }}><Dot color="#9AA3B5" />Disabled</span>
-  if (conn.system_type === 'jira_apache' || conn.system_type === 'bugzilla' ||
-      conn.system_type === 'confluence' || conn.system_type === 'customer_portal')
+  if (conn.auth_type === 'none' || conn.system_type === 'jira_apache' || conn.system_type === 'bugzilla' ||
+      conn.system_type === 'confluence' || conn.system_type === 'customer_portal' || conn.system_type === 'support_kb')
     return <span style={{ display: 'flex', alignItems: 'center', fontSize: 12, color: 'var(--green)' }}><Dot color="#166534" />Internal/Public</span>
   if (conn.token_present)
     return <span style={{ display: 'flex', alignItems: 'center', fontSize: 12, color: 'var(--green)' }}><Dot color="#166534" />Connected</span>
@@ -166,29 +175,19 @@ export default function SettingsPage() {
       display_name: connector.display_name || '',
       base_url: connector.base_url || '',
       project_key: connector.project_key || '',
+      ticket_prefix: connector.ticket_prefix || '',
+      auth_type: connector.auth_type || 'bearer_token',
       token: '',
     })
   }
 
   const handleEditSave = async (source_id) => {
     try {
-      const authToken = localStorage.getItem('hpe_token')
-      const response = await fetch(`/settings/connections/${source_id}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify(editForm),
-      })
-      if (response.ok) {
-        setEditingId(null)
-        fetchConnections()
-      } else {
-        alert('Failed to update connection')
-      }
+      await updateConnection(source_id, editForm)
+      setEditingId(null)
+      fetchConnections()
     } catch (err) {
-      alert('Error updating connection')
+      alert('Error updating connection: ' + (err.response?.data?.detail || err.message))
     }
   }
 
@@ -438,6 +437,23 @@ export default function SettingsPage() {
                           onChange={e => setEditForm({ ...editForm, project_key: e.target.value })} />
                       </div>
                       <div>
+                        <label className="form-label" style={{ fontSize: 11 }}>Ticket Prefix</label>
+                        <input className="form-input" style={{ width: '100%' }}
+                          value={editForm.ticket_prefix}
+                          onChange={e => setEditForm({ ...editForm, ticket_prefix: e.target.value })} />
+                      </div>
+                      <div>
+                        <label className="form-label" style={{ fontSize: 11 }}>Auth Type</label>
+                        <select className="form-select" style={{ width: '100%' }}
+                          value={editForm.auth_type}
+                          onChange={e => setEditForm({ ...editForm, auth_type: e.target.value })}>
+                          <option value="bearer_token">Bearer Token</option>
+                          <option value="basic">Basic</option>
+                          <option value="pat">PAT</option>
+                          <option value="none">None</option>
+                        </select>
+                      </div>
+                      <div>
                         <label className="form-label" style={{ fontSize: 11 }}>New Token (leave blank to keep existing)</label>
                         <input className="form-input" style={{ width: '100%' }} type="password"
                           placeholder="Leave blank to keep existing token"
@@ -556,6 +572,16 @@ export default function SettingsPage() {
                 <input className="form-input" style={{ width: '100%' }} type="password" placeholder="Leave empty for public APIs"
                   value={addForm.auth_token} onChange={(e) => setAddForm((f) => ({ ...f, auth_token: e.target.value }))} />
                 <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 4 }}>Not required for Apache JIRA and Bugzilla</div>
+              </div>
+              <div>
+                <label className="form-label">Auth Type</label>
+                <select className="form-select" style={{ width: '100%' }} value={addForm.auth_type || 'bearer_token'}
+                  onChange={(e) => setAddForm((f) => ({ ...f, auth_type: e.target.value }))}>
+                  <option value="bearer_token">Bearer Token</option>
+                  <option value="basic">Basic</option>
+                  <option value="pat">PAT</option>
+                  <option value="none">None</option>
+                </select>
               </div>
               <div>
                 <label className="form-label">Project Key</label>

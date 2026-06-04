@@ -3,6 +3,12 @@ import { useNavigate } from 'react-router-dom'
 import { getBugs, getBugStatus, refreshBugCache, getMetrics } from '../api/bugs'
 import { startTriage } from '../api/triage'
 
+const toPercent = (score) => {
+  if (score == null) return 0
+  if (score > 1) return Math.min(Math.round(score), 100)
+  return Math.min(Math.round(score * 100), 100)
+}
+
 const SRC_CLS = { github: 'sb-gh', jira_apache: 'sb-jira', bugzilla: 'sb-bz', confluence: 'sb-cf', customer_portal: 'sb-jira' }
 const SRC_LBL = { github: 'GH', jira_apache: 'JIRA', bugzilla: 'BZ', confluence: 'CF', customer_portal: 'CP' }
 const SEV_CLS = { P0: 'sev-p0', P1: 'sev-p1', P2: 'sev-p2', P3: 'sev-p3' }
@@ -25,6 +31,15 @@ function fmtDate(iso) {
 }
 
 /* ─── Status panel (SD7 / SD8 / SD9) shown when expanding an untriaged row ─── */
+function formatChange(change) {
+  if (!change) return ''
+  if (typeof change === 'string') return change
+  const field = change.field || 'field'
+  const from = change.from || 'empty'
+  const to = change.to || 'empty'
+  return `${field}: ${from} -> ${to}`
+}
+
 function BugStatusPanel({ bugId, status, loading, onTriage, onView, triaging }) {
   if (loading) {
     return (
@@ -55,7 +70,7 @@ function BugStatusPanel({ bugId, status, loading, onTriage, onView, triaging }) 
   }
 
   const lastDate = fmtDate(status.last_triaged_at)
-  const confPct  = status.last_confidence ? Math.round(status.last_confidence * 100) : null
+  const confPct  = status.last_confidence != null ? toPercent(status.last_confidence) : null
 
   // SD7 — changes found
   if (status.needs_retriage && status.changes?.length > 0) {
@@ -96,7 +111,7 @@ function BugStatusPanel({ bugId, status, loading, onTriage, onView, triaging }) 
         {status.case_id && (
           <button className="btn btn-outline btn-sm" onClick={() => onView(status.case_id)}>View Previous Results</button>
         )}
-        <button className="btn btn-ghost btn-sm" onClick={() => onTriage(bugId)} disabled={triaging === bugId}>
+        <button className="btn btn-ghost btn-sm" onClick={() => onTriage(bugId, true)} disabled={triaging === bugId}>
           {triaging === bugId ? '…' : 'Re-triage Anyway'}
         </button>
       </div>
@@ -117,7 +132,10 @@ function ExpandableBugRow({ bug, onTriage, triaging, navigate }) {
       setStatusLoading(true)
       try {
         const s = await getBugStatus(bug.ticket_id)
-        setStatus(s)
+        setStatus({
+          ...s,
+          changes: (s.changes || []).map(formatChange),
+        })
       } catch {
         setStatus({ is_new: true, needs_retriage: true, changes: [] })
       } finally {
@@ -174,7 +192,7 @@ function ExpandableBugRow({ bug, onTriage, triaging, navigate }) {
 function TriagedBugRow({ bug, onRetriage, retriaging, navigate }) {
   const [open, setOpen] = useState(false)
   const triage = bug.triage_info || {}
-  const confPct = triage.confidence ? Math.round(triage.confidence * 100) : null
+  const confPct = triage.confidence != null ? toPercent(triage.confidence) : null
   const triagedAt = fmtDate(triage.triaged_at)
   const caseIdShort = triage.case_id ? `BT-${triage.case_id.slice(0, 6).toUpperCase()}` : 'BT-?'
   const systems = triage.systems_queried || []
@@ -206,7 +224,7 @@ function TriagedBugRow({ bug, onRetriage, retriaging, navigate }) {
         <span className="bug-flat-time">{triagedAt}</span>
         <button
           className="btn btn-outline btn-sm"
-          onClick={(e) => { e.stopPropagation(); onRetriage(bug) }}
+          onClick={(e) => { e.stopPropagation(); onRetriage(bug, true) }}
           disabled={retriaging === bug.ticket_id}
         >
           {retriaging === bug.ticket_id ? '…' : 'Re-triage'}
@@ -259,6 +277,7 @@ export default function BugListPage() {
   const [search,        setSearch]        = useState('')
   const [severity,      setSeverity]      = useState('')
   const [source,        setSource]        = useState('')
+  const [status,        setStatus]        = useState('open')
   const [activePill,    setActivePill]    = useState('All')
   const [triagingId,    setTriagingId]    = useState(null)
   const [lastSynced,    setLastSynced]    = useState(null)
@@ -266,9 +285,11 @@ export default function BugListPage() {
   const [refreshing,    setRefreshing]    = useState(false)
   const [sourcesOnline, setSourcesOnline] = useState(0)
   const [isPartial,     setIsPartial]     = useState(false)
+  const [cacheStatus,   setCacheStatus]   = useState(null)
   const [metrics,       setMetrics]       = useState(null)
-  const navigate    = useNavigate()
-  const intervalRef = useRef(null)
+  const navigate      = useNavigate()
+  const intervalRef   = useRef(null)
+  const pollCountRef  = useRef(0)
 
   // Debounce search
   useEffect(() => {
@@ -276,21 +297,28 @@ export default function BugListPage() {
     return () => clearTimeout(timer)
   }, [searchInput])
 
-  const fetchBugs = useCallback(async () => {
-    setLoading(true)
+  const fetchBugs = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true)
+      pollCountRef.current = 0
+    }
     try {
-      const data = await getBugs({ page, severity, source: source || undefined, search })
-      setBugs(data.bugs || [])
+      const data = await getBugs({ page, severity, source: source || undefined, status, search })
+      // Backend returns a flat `bugs` array (ungrouped + group children).
+      // Fall back to `ungrouped` for older cached responses that predate this field.
+      const allBugs = data.bugs || [...(data.ungrouped || []), ...(data.groups || [])]
+      setBugs(allBugs)
       setTotal(data.total || 0)
       setSourcesOnline(data.sources_online || 0)
       setIsPartial(data.partial || false)
       setLastSynced(new Date())
+      setCacheStatus(data.cache_status || 'hit')
     } catch (e) {
       console.error('Failed to fetch bugs', e)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
-  }, [page, severity, source, search])
+  }, [page, severity, source, status, search])
 
   useEffect(() => {
     fetchBugs()
@@ -298,18 +326,31 @@ export default function BugListPage() {
     return () => clearInterval(intervalRef.current)
   }, [fetchBugs])
 
+  // Poll every 1 s on cold start until data arrives (max 3 polls, then stop)
+  useEffect(() => {
+    if (cacheStatus !== 'cold') return
+    if (pollCountRef.current >= 3) return  // hard stop at 3
+
+    const timer = setTimeout(() => {
+      pollCountRef.current += 1
+      fetchBugs(true)  // silent fetch
+    }, 1000)
+
+    return () => clearTimeout(timer)
+  }, [cacheStatus, fetchBugs])
+
   // Fetch metrics for dashboard strip
   useEffect(() => {
     getMetrics().then(setMetrics).catch(console.error)
   }, [])
 
-  const handleTriage = async (bugOrId) => {
+  const handleTriage = async (bugOrId, forceRefresh = false) => {
     // Accept either a full bug object { ticket_id, source_id } or a plain string (direct triage bar)
-    const bugId   = typeof bugOrId === 'string' ? bugOrId : bugOrId.ticket_id
+    const bugId    = typeof bugOrId === 'string' ? bugOrId : bugOrId.ticket_id
     const sourceId = typeof bugOrId === 'string' ? '' : (bugOrId.source_id || '')
     setTriagingId(bugId)
     try {
-      const data = await startTriage(bugId, sourceId)
+      const data = await startTriage(bugId, sourceId, forceRefresh)
       navigate(`/triage/${data.case_id}`)
     } catch (e) {
       alert('Failed to start triage: ' + (e.response?.data?.detail || e.message))
@@ -361,6 +402,8 @@ export default function BugListPage() {
           <span style={{ color: 'var(--text3)' }}>·</span>
           <span style={{ color: '#D97706' }}>⏳ Needs Triage: {metrics.needs_triage ?? 0}</span>
           <span style={{ color: 'var(--text3)' }}>·</span>
+          <span style={{ color: 'var(--red)' }}>Failed: {metrics.failed_triages ?? 0}</span>
+          <span style={{ color: 'var(--text3)' }}>Â·</span>
           <span style={{ color: 'var(--teal)', fontWeight: 700 }}>
             🟢 {metrics.sources_online ?? 0}/{metrics.sources_total ?? 0} Systems Online
           </span>
@@ -423,6 +466,19 @@ export default function BugListPage() {
         >
           <option value="">All Severities</option>
           {SEVERITY_ORDER.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+
+        <select
+          className="form-select filter-select"
+          style={{ width: 'auto' }}
+          value={status}
+          onChange={(e) => { setStatus(e.target.value); setPage(1) }}
+        >
+          <option value="">All Statuses</option>
+          <option value="open">Open</option>
+          <option value="in progress">In Progress</option>
+          <option value="resolved">Resolved</option>
+          <option value="closed">Closed</option>
         </select>
 
         <div className="filter-pills">
@@ -495,19 +551,34 @@ export default function BugListPage() {
         </div>
       )}
 
+      {/* Non-blocking cold-start banner (shown while background fetch runs) */}
+      {!loading && cacheStatus === 'cold' && bugs.length === 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10,
+          background: 'var(--bg)', border: '1px solid var(--border)',
+          borderRadius: 7, padding: '10px 14px', fontSize: 13, color: 'var(--text2)',
+        }}>
+          <span style={{
+            display: 'inline-block', width: 14, height: 14, borderRadius: '50%',
+            border: '2px solid var(--teal)', borderTopColor: 'transparent',
+            animation: 'spin 0.8s linear infinite', flexShrink: 0,
+          }} />
+          <span>Fetching live data… (first load)</span>
+        </div>
+      )}
+
       {/* Bug rows */}
-      {loading ? (
+      {loading && bugs.length === 0 ? (
         <div>
-          {Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} className="bug-flat" style={{ opacity: 1 }}>
-              <div className="skeleton-pulse" style={{ width: 32, height: 18, borderRadius: 4 }} />
-              <div className="skeleton-pulse" style={{ width: 80, height: 14, borderRadius: 3 }} />
-              <div className="skeleton-pulse" style={{ flex: 1, height: 14, borderRadius: 3 }} />
-              <div className="skeleton-pulse" style={{ width: 36, height: 18, borderRadius: 4 }} />
-              <div className="skeleton-pulse" style={{ width: 56, height: 18, borderRadius: 4 }} />
-              <div className="skeleton-pulse" style={{ width: 64, height: 14, borderRadius: 3 }} />
-              <div className="skeleton-pulse" style={{ width: 72, height: 28, borderRadius: 5 }} />
-            </div>
+          {[...Array(5)].map((_, i) => (
+            <div key={i} style={{
+              height: '64px',
+              background: 'var(--color-background-secondary)',
+              borderRadius: '8px',
+              marginBottom: '8px',
+              opacity: 1 - (i * 0.15),
+              animation: 'pulse 1.5s ease-in-out infinite',
+            }} />
           ))}
         </div>
       ) : visibleBugs.length === 0 ? (
@@ -528,17 +599,11 @@ export default function BugListPage() {
               </div>
             )
           }
+          if (cacheStatus === 'cold') return null  // banner above is shown instead
           return (
-            <div className="card" style={{ textAlign: 'center', padding: '40px' }}>
-              <div style={{ fontSize: 14, color: 'var(--text2)', fontWeight: 600, marginBottom: 6 }}>
-                Loading bugs from external systems...
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 16 }}>
-                This may take 15–20 seconds on first load. Bugs are cached for 5 minutes.
-              </div>
-              <button className="btn btn-teal btn-sm" onClick={fetchBugs} disabled={loading}>
-                {loading ? 'Loading…' : 'Retry'}
-              </button>
+            <div className="card" style={{ textAlign: 'center', padding: '40px', color: 'var(--text3)', fontSize: 13 }}>
+              <div style={{ marginBottom: 12 }}>No bugs found. Try refreshing.</div>
+              <button className="btn btn-ghost btn-sm" onClick={() => fetchBugs()}>Retry</button>
             </div>
           )
         })()
@@ -560,7 +625,7 @@ export default function BugListPage() {
             <TriagedBugRow
               key={`triaged-${bug.ticket_id}-${idx}`}
               bug={bug}
-              onRetriage={(b) => handleTriage(b)}
+              onRetriage={(b, fr) => handleTriage(b, fr)}
               retriaging={triagingId}
               navigate={navigate}
             />

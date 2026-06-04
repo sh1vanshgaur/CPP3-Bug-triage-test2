@@ -14,10 +14,13 @@ router = APIRouter(tags=["settings"])
 
 SYSTEM_TYPE_LABELS = {
     "github":          {"label": "GitHub",           "icon": "GH",   "color": "purple"},
+    "jira":            {"label": "JIRA",             "icon": "J",    "color": "blue"},
     "jira_apache":     {"label": "Apache JIRA",      "icon": "J",    "color": "blue"},
+    "jira_cloud":      {"label": "JIRA Cloud",       "icon": "J",    "color": "blue"},
     "bugzilla":        {"label": "Bugzilla",         "icon": "BZ",   "color": "amber"},
     "confluence":      {"label": "Confluence",       "icon": "CF",   "color": "teal"},
     "customer_portal": {"label": "Customer Portal",  "icon": "CP",   "color": "green"},
+    "support_kb":      {"label": "Support KB",       "icon": "KB",   "color": "teal"},
 }
 
 
@@ -25,6 +28,8 @@ class ConnectionCreate(BaseModel):
     display_name: str
     system_type: str
     base_url: str
+    port: Optional[int] = None
+    auth_type: Optional[str] = "bearer_token"
     auth_token: Optional[str] = ""
     project_key: Optional[str] = ""
     ticket_prefix: Optional[str] = ""
@@ -32,7 +37,11 @@ class ConnectionCreate(BaseModel):
 
 class ConnectionUpdate(BaseModel):
     display_name: Optional[str] = None
+    base_url: Optional[str] = None
+    port: Optional[int] = None
+    auth_type: Optional[str] = None
     auth_token: Optional[str] = None
+    token: Optional[str] = None
     project_key: Optional[str] = None
     ticket_prefix: Optional[str] = None
     enabled: Optional[bool] = None
@@ -50,6 +59,8 @@ def _format_source(s) -> dict:
         "icon":            meta["icon"],
         "color":           meta["color"],
         "base_url":        s.base_url,
+        "port":            s.port,
+        "auth_type":       s.auth_type,
         "project_key":     s.project_key or "",
         "ticket_prefix":   s.ticket_prefix or "",
         "auth_secret_ref": token_env_var,
@@ -103,11 +114,13 @@ async def add_connection(
     )
     try:
         import asyncio
-        results = await asyncio.wait_for(
-            test_connector.search("", max_results=1),
+        health = await asyncio.wait_for(
+            test_connector.health_check(),
             timeout=10.0,
         )
-        test_message = f"Connection successful — found {len(results)} result(s)"
+        if not health.get("ok"):
+            raise RuntimeError(health.get("error") or "health check failed")
+        test_message = "Connection successful"
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -123,7 +136,8 @@ async def add_connection(
             "display_name":    body.display_name,
             "system_type":     body.system_type,
             "base_url":        body.base_url,
-            "auth_type":       "bearer_token",
+            "port":            body.port,
+            "auth_type":       body.auth_type or "bearer_token",
             "auth_secret_ref": env_var_name,
             "project_key":     body.project_key or "",
             "ticket_prefix":   body.ticket_prefix or "",
@@ -149,6 +163,12 @@ async def update_connection(
         updates = {}
         if body.display_name is not None:
             updates["display_name"] = body.display_name
+        if body.base_url is not None:
+            updates["base_url"] = body.base_url.rstrip("/")
+        if body.port is not None:
+            updates["port"] = body.port
+        if body.auth_type is not None:
+            updates["auth_type"] = body.auth_type
         if body.project_key is not None:
             updates["project_key"] = body.project_key
         if body.ticket_prefix is not None:
@@ -156,10 +176,11 @@ async def update_connection(
         if body.enabled is not None:
             updates["enabled"] = body.enabled
 
-        if body.auth_token:
+        new_token = body.auth_token or body.token
+        if new_token:
             env_var = source.auth_secret_ref or ""
             if env_var:
-                os.environ[env_var] = body.auth_token
+                os.environ[env_var] = new_token
 
         if updates:
             await update_source(db, source_id, updates)
@@ -185,7 +206,7 @@ async def remove_connection(
 
 
 @router.put("/connections/{source_id}")
-async def update_connection(
+async def update_connection_legacy(
     source_id: str,
     payload: dict,
     user: User = Depends(get_current_user),
@@ -196,7 +217,7 @@ async def update_connection(
     try:
         async with AsyncSessionLocal() as db:
             from sqlalchemy import update as sql_update
-            from ..orchestrator.db.models import SourceRegistry
+            from orchestrator.db.models import SourceRegistry
 
             update_data = {}
             if "display_name" in payload:
@@ -263,12 +284,15 @@ async def test_connection(
 
     try:
         import asyncio
-        results = await asyncio.wait_for(connector.search("", max_results=1), timeout=10.0)
+        health = await asyncio.wait_for(connector.health_check(), timeout=10.0)
+        if not health.get("ok"):
+            raise RuntimeError(health.get("error") or "health check failed")
         return {
             "status": "ok",
             "source_id": source_id,
-            "message": f"Connected · {len(results)} bugs found",
+            "message": "Connected",
             "token_present": bool(token),
+            "latency_ms": health.get("latency_ms", 0),
         }
     except Exception as e:
         return {

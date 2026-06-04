@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..auth import get_current_user, User
 from orchestrator.connectors.registry import ConnectorRegistry
 from orchestrator.redis_client import get_cached_buglist, cache_buglist
+from orchestrator.utils.url_utils import sanitize_bug_url
 from orchestrator.db.session import AsyncSessionLocal
 from orchestrator.db.models import (
     AuditLog, SystemGroupRegistry, BugGroupMapping,
@@ -361,30 +362,45 @@ async def _background_fetch_connector(connector) -> None:
                 tickets = []
 
         if tickets:
-            data = [dataclasses.asdict(t) for t in tickets]
+            # Sanitize URLs at write time so every future cache read is clean
+            connector_base_url = getattr(connector, "base_url", "")
+            sanitized_data = []
+            for t in tickets:
+                t_dict = dataclasses.asdict(t)
+                t_dict["url"] = sanitize_bug_url(
+                    url=t_dict.get("url", ""),
+                    system_type=connector.system_type,
+                    bug_id=t_dict.get("ticket_id", ""),
+                    base_url=connector_base_url,
+                )
+                sanitized_data.append(t_dict)
+
             await cache_buglist(
                 connector.source_id, "open", "",
-                data, ttl=120)
+                sanitized_data, ttl=300)
 
             from orchestrator.redis_client import get_redis
             r = await get_redis()
-            for ticket in tickets:
-                bug_id = ticket.ticket_id
-                t_dict = dataclasses.asdict(ticket)
+            for t_dict in sanitized_data:
+                bug_id = t_dict.get("ticket_id", "")
+                if not bug_id:
+                    continue
                 await r.hset(
                     f"bug:data:{bug_id}", "data",
                     json.dumps(t_dict))
-                await r.expire(f"bug:data:{bug_id}", 120)
+                await r.expire(f"bug:data:{bug_id}", 300)
 
                 score = get_bug_score(
-                    ticket.severity, ticket.updated_at)
+                    t_dict.get("severity"), t_dict.get("updated_at"))
                 await r.zadd(
                     "buglist:all:scores", {bug_id: score})
 
-            await r.expire("buglist:all:scores", 120)
+            await r.expire("buglist:all:scores", 300)
+            await r.set(
+                "buglist:last_refreshed", str(time.time()), ex=300)
 
             print(f"[BugList] {connector.source_id}: "
-                  f"{len(data)} bugs cached")
+                  f"{len(sanitized_data)} bugs cached")
 
     except Exception as e:
         print(f"[BugList] {connector.source_id} "
@@ -431,12 +447,42 @@ async def get_bugs(
     try:
         cached = await r.get(cache_key)
         if cached:
-            return json.loads(cached)
+            data = json.loads(cached)
+            if "cache_status" not in data:
+                data["cache_status"] = "hit"
+            if "bugs" not in data:
+                data["bugs"] = (
+                    data.get("ungrouped", []) + [
+                        child
+                        for group in data.get("groups", [])
+                        for child in group.get("children", [])
+                    ]
+                )
+            return data
     except Exception:
         pass
 
     # Fetch bug IDs from ZSET then bulk-fetch data hashes
     bug_ids = await r.zrevrange("buglist:all:scores", 0, -1)
+
+    # Cold start: nothing in cache yet — fire background fetch and return immediately
+    if not bug_ids:
+        sources_online = len(connectors)
+        for c in connectors:
+            asyncio.create_task(_background_fetch_connector(c))
+        return {
+            "bugs": [],
+            "ungrouped": [],
+            "groups": [],
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "sources_online": sources_online,
+            "sources_total": len(connectors),
+            "partial": False,
+            "cache_status": "cold",
+            "cached_at": None,
+        }
 
     all_bugs = []
     if bug_ids:
@@ -490,6 +536,7 @@ async def get_bugs(
         all_bugs = [
             b for b in all_bugs
             if b.get("source_id", "") == source
+            or b.get("system_type", "") == source
         ]
     if status:
         all_bugs = [
@@ -519,14 +566,32 @@ async def get_bugs(
             bug["triage_info"] = None
         assembled = {"ungrouped": page_bugs, "groups": []}
 
+    # Build flat bugs list for frontend (ungrouped + group children)
+    flat_bugs = assembled.get("ungrouped", []) + [
+        child
+        for group in assembled.get("groups", [])
+        for child in group.get("children", [])
+    ]
+
+    cached_at = None
+    try:
+        ts = await r.get("buglist:last_refreshed")
+        if ts:
+            cached_at = float(ts)
+    except Exception:
+        pass
+
     response = {
         **assembled,
+        "bugs":          flat_bugs,
         "total":         total,
         "page":          page,
         "page_size":     page_size,
         "sources_online": sources_online,
         "sources_total": len(connectors),
         "partial":       False,
+        "cache_status":  "hit",
+        "cached_at":     cached_at,
     }
 
     # Cache assembled response (TTL 30 s)
@@ -585,9 +650,11 @@ async def get_bug_status(
         }
 
     summary           = last_triage.summary or {}
-    ticket_updated_at = summary.get("updated_at", "")
-    last_severity     = summary.get("severity", "")
-    last_status       = summary.get("status", "")
+    ticket_updated_at = summary.get("ticket_updated_at") or summary.get("updated_at", "")
+    last_severity     = summary.get("ticket_severity") or summary.get("severity", "")
+    last_status       = summary.get("ticket_status") or summary.get("status", "")
+    ai_severity       = summary.get("ai_severity") or summary.get("severity", "")
+    root_cause        = summary.get("root_cause", "")
     last_confidence   = summary.get("confidence", 0)
     last_triaged_at   = (
         last_triage.created_at.isoformat()
@@ -623,7 +690,10 @@ async def get_bug_status(
             "is_new":           False,
             "last_triaged_at":  last_triaged_at,
             "last_severity":    last_severity,
+            "last_ai_severity": ai_severity,
             "last_confidence":  last_confidence,
+            "root_cause":       root_cause,
+            "case_id":          last_triage.case_id,
             "changes":          [],
             "needs_retriage":   False,
         }
@@ -645,7 +715,10 @@ async def get_bug_status(
             "is_new":           False,
             "last_triaged_at":  last_triaged_at,
             "last_severity":    last_severity,
+            "last_ai_severity": ai_severity,
             "last_confidence":  last_confidence,
+            "root_cause":       root_cause,
+            "case_id":          last_triage.case_id,
             "changes":          [],
             "needs_retriage":   False,
         }
@@ -687,7 +760,10 @@ async def get_bug_status(
             "is_new":           False,
             "last_triaged_at":  last_triaged_at,
             "last_severity":    last_severity,
+            "last_ai_severity": ai_severity,
             "last_confidence":  last_confidence,
+            "root_cause":       root_cause,
+            "case_id":          last_triage.case_id,
             "changes":          [],
             "needs_retriage":   False,
         }
@@ -741,7 +817,10 @@ async def get_bug_status(
         "is_new":           False,
         "last_triaged_at":  last_triaged_at,
         "last_severity":    last_severity,
+        "last_ai_severity": ai_severity,
         "last_confidence":  last_confidence,
+        "root_cause":       root_cause,
+        "case_id":          last_triage.case_id,
         "changes":          changes,
         "needs_retriage":   True,
     }
@@ -753,6 +832,10 @@ async def get_metrics(user: User = Depends(get_current_user)):
         summary = await get_metrics_summary(db)
         recent  = await list_recent_pipeline_completions(
             db, limit=10)
+        failed_result = await db.execute(
+            select(AuditLog.id).where(AuditLog.status == "failed")
+        )
+        failed_triages = len(failed_result.scalars().all())
 
     all_connectors = await ConnectorRegistry.get_all_enabled()
     bug_connectors = [
@@ -827,6 +910,7 @@ async def get_metrics(user: User = Depends(get_current_user)):
         "live_total_bugs": live_total,
         "triaged_today":   triaged_today,
         "needs_triage":    needs_triage,
+        "failed_triages":  failed_triages,
         "recent_activity": [
             {
                 "case_id":    e.case_id or "",
@@ -892,7 +976,7 @@ async def get_case_result(
     user: User = Depends(get_current_user),
 ):
     from fastapi import HTTPException
-    from orchestrator.redis_client import get_cached_case_result
+    from orchestrator.redis_client import get_cached_case_result, get_redis
     cached = await get_cached_case_result(case_id)
     if not cached:
         raise HTTPException(
@@ -901,4 +985,26 @@ async def get_case_result(
                 "Case result not found. "
                 "Results are cached for 1 hour after triage."),
         )
+
+    # BUG3: if Panel 2/3 are missing from cached context, recover from
+    # dedicated per-case keys (set by orchestrator after Phase 2)
+    ctx = cached.get("context", {})
+    try:
+        r = await get_redis()
+        if not ctx.get("related_tickets"):
+            val = await r.get(f"related:{case_id}")
+            if val:
+                ctx["related_tickets"] = json.loads(val)
+        if not ctx.get("kb_articles"):
+            val = await r.get(f"kb:{case_id}")
+            if val:
+                ctx["kb_articles"] = json.loads(val)
+        if not ctx.get("enrichment_sources"):
+            val = await r.get(f"enrichment:{case_id}")
+            if val:
+                ctx["enrichment_sources"] = json.loads(val)
+        cached["context"] = ctx
+    except Exception:
+        pass
+
     return cached
