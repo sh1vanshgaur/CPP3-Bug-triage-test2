@@ -83,12 +83,15 @@ class GithubConnector(BaseConnector):
     async def get(self, ticket_id: str) -> TicketData | None:
         url = f"{self.base_url}/repos/{self._repo()}/issues/{ticket_id}"
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers())
                 if resp.status_code == 404:
                     return None
                 resp.raise_for_status()
-                return self._normalise(resp.json())
+                raw_data = resp.json()
+                ticket = self._normalise(raw_data)
+                ticket.direct_reference_links = self.extract_links(raw_data)
+                return ticket
         except Exception:
             return None
 
@@ -101,7 +104,7 @@ class GithubConnector(BaseConnector):
             params = {"state": "open", "per_page": min(max_results, 100), "page": page, "sort": "updated", "direction": "desc"}
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers(), params=params)
                 if resp.status_code != 200:
                     return []
@@ -122,7 +125,7 @@ class GithubConnector(BaseConnector):
     async def get_lightweight(self, ticket_id: str) -> dict:
         url = f"{self.base_url}/repos/{self._repo()}/issues/{ticket_id}"
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(url, headers=self._headers())
                 if resp.status_code != 200:
                     return {}
@@ -199,7 +202,7 @@ class GithubConnector(BaseConnector):
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         url = f"{self.base_url}/repos/{self._repo()}/issues/{ticket_id}/events"
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers())
                 resp.raise_for_status()
                 events = resp.json()

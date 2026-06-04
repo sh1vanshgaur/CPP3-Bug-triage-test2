@@ -69,21 +69,24 @@ class BugzillaConnector(BaseConnector):
             "include_fields": "id,summary,status,priority,severity,component,assigned_to,creator,creation_time,last_change_time,see_also,description"
         }
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers(), params=params)
                 if resp.status_code == 404:
                     return None
                 resp.raise_for_status()
-                bugs = resp.json().get("bugs") or []
+                raw_data = resp.json()
+                bugs = raw_data.get("bugs") or []
                 if not bugs:
                     return None
-                return self._normalise(bugs[0])
+                ticket = self._normalise(bugs[0])
+                ticket.direct_reference_links = self.extract_links(raw_data)
+                return ticket
         except Exception:
             return None
 
     async def search(self, query: str, max_results: int = 300) -> list[TicketData]:
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 if not query:
                     url = f"{self.base_url}/rest/bug"
                     params = [
@@ -122,7 +125,7 @@ class BugzillaConnector(BaseConnector):
         url = f"{self.base_url}/rest/bug/{ticket_id}"
         params = {"include_fields": "last_change_time,priority,status"}
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(url, headers=self._headers(), params=params)
                 if resp.status_code != 200:
                     return {}
@@ -193,7 +196,7 @@ class BugzillaConnector(BaseConnector):
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         url = f"{self.base_url}/rest/bug/{ticket_id}/history"
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers())
                 resp.raise_for_status()
                 data = resp.json()

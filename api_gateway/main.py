@@ -39,16 +39,15 @@ async def lifespan(app: FastAPI):
         async def background_ingestion():
             while True:
                 try:
-                    await asyncio.sleep(600)  # Run every 10 minutes
-
-                    # Acquire Redis lock to prevent duplicate runs
+                    # Acquire Redis lock to prevent duplicate runs (tight TTL of 60 seconds)
                     from orchestrator.redis_client import get_redis
                     redis = await get_redis()
                     lock = await redis.set(
                         "lock:ingest:all", "active",
-                        ex=660, nx=True)
+                        ex=60, nx=True)
                     if not lock:
                         log.info("[Ingestion] Already running, skipping")
+                        await asyncio.sleep(10)
                         continue
 
                     try:
@@ -86,6 +85,9 @@ async def lifespan(app: FastAPI):
 
                 except Exception as e:
                     log.warning(f"[Ingestion] Cycle error: {e}")
+
+                # Run every 60 seconds to keep 120s TTL cache warm
+                await asyncio.sleep(60)
 
         ingestion_task = asyncio.create_task(background_ingestion())
         app.state.ingestion_task = ingestion_task

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, Request
 from jose import JWTError, jwt
@@ -67,15 +68,33 @@ async def start_triage(
 
     case_id = str(uuid4())
     producer = getattr(request.app.state, "kafka_producer", None)
-    published = False
 
-    if producer:
-        published = await publish_triage_request(producer, case_id, bug_id, source_id, user.user_id)
+    # Always run pipeline locally when fallback is enabled
+    enable_fallback = os.getenv(
+        "ENABLE_LOCAL_PIPELINE_FALLBACK", "true"
+    ).lower() == "true"
 
-    if not published and ENABLE_LOCAL_PIPELINE_FALLBACK:
+    if enable_fallback:
         from orchestrator.orchestrator import TaskOrchestrator
         orch = TaskOrchestrator()
-        asyncio.create_task(orch.run(case_id, bug_id, source_id, user.user_id))
+        asyncio.create_task(
+            orch.run(case_id, bug_id, source_id,
+                     user.user_id))
+    else:
+        published = False
+        if producer:
+            try:
+                published = await publish_triage_request(
+                    producer, case_id, bug_id,
+                    source_id, user.user_id)
+            except Exception:
+                published = False
+        if not published:
+            from orchestrator.orchestrator import TaskOrchestrator
+            orch = TaskOrchestrator()
+            asyncio.create_task(
+                orch.run(case_id, bug_id, source_id,
+                         user.user_id))
 
     return {"case_id": case_id, "bug_id": bug_id, "source_id": source_id, "status": "accepted"}
 

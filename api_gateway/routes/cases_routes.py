@@ -128,6 +128,23 @@ async def debug_sources():
     }
 
 
+def get_bug_score(severity: str, updated_at: str) -> float:
+    sev_val = {"P0": 4, "P1": 3, "P2": 2, "P3": 1}.get(severity or "Unknown", 0)
+    ts = 0.0
+    if updated_at:
+        try:
+            s = str(updated_at).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            if len(s) > 5 and s[-5] in ('+', '-'):
+                s = s[:-2] + ":" + s[-2:]
+            dt = datetime.fromisoformat(s)
+            ts = dt.timestamp()
+        except Exception:
+            pass
+    return sev_val * 10 + (ts / 2000000000.0)
+
+
 async def _background_fetch_connector(connector) -> None:
     try:
         connector_class = type(connector).__name__.lower()
@@ -140,7 +157,7 @@ async def _background_fetch_connector(connector) -> None:
                         connector.search(
                             "", max_results=100,
                             start_at=start_at),
-                        timeout=20.0)
+                        timeout=8.0)  # tightened timeout
                     if not batch:
                         break
                     tickets.extend(batch)
@@ -155,7 +172,7 @@ async def _background_fetch_connector(connector) -> None:
                     batch = await asyncio.wait_for(
                         connector.search(
                             "", max_results=100, page=page),
-                        timeout=15.0)
+                        timeout=8.0)  # tightened timeout
                     if not batch:
                         break
                     tickets.extend(batch)
@@ -168,7 +185,7 @@ async def _background_fetch_connector(connector) -> None:
             try:
                 tickets = await asyncio.wait_for(
                     connector.search("", max_results=300),
-                    timeout=20.0)
+                    timeout=8.0)  # tightened timeout
             except (asyncio.TimeoutError, Exception):
                 tickets = []
 
@@ -176,7 +193,7 @@ async def _background_fetch_connector(connector) -> None:
             try:
                 tickets = await asyncio.wait_for(
                     connector.search("", max_results=50),
-                    timeout=10.0)
+                    timeout=5.0)  # tightened timeout
             except (asyncio.TimeoutError, Exception):
                 tickets = []
 
@@ -184,30 +201,28 @@ async def _background_fetch_connector(connector) -> None:
             data = [dataclasses.asdict(t) for t in tickets]
             await cache_buglist(
                 connector.source_id, "open", "",
-                data, ttl=300)
+                data, ttl=120)  # 120s TTL
+
+            from orchestrator.redis_client import get_redis
+            import json
+            r = await get_redis()
+            for ticket in tickets:
+                bug_id = ticket.ticket_id
+                t_dict = dataclasses.asdict(ticket)
+                await r.hset(f"bug:data:{bug_id}", "data", json.dumps(t_dict))
+                await r.expire(f"bug:data:{bug_id}", 120)
+
+                score = get_bug_score(ticket.severity, ticket.updated_at)
+                await r.zadd("buglist:all:scores", {bug_id: score})
+
+            await r.expire("buglist:all:scores", 120)
+
             print(f"[BugList] {connector.source_id}: "
                   f"{len(data)} bugs cached")
 
     except Exception as e:
         print(f"[BugList] {connector.source_id} "
               f"background fetch error: {e}")
-
-
-async def fetch_for_connector(connector):
-    excluded = {"confluence", "customer_portal"}
-    if connector.system_type in excluded:
-        return connector.source_id, [], False
-
-    cached = await get_cached_buglist(
-        connector.source_id, "open", "")
-    if cached is not None:
-        return connector.source_id, cached, True
-
-    # Cache miss: trigger background fetch and return empty
-    # User gets instant response, cache fills in background
-    asyncio.create_task(
-        _background_fetch_connector(connector))
-    return connector.source_id, [], False
 
 
 @router.get("/bugs")
@@ -221,7 +236,6 @@ async def get_bugs(
     user: User = Depends(get_current_user),
 ):
     all_connectors = await ConnectorRegistry.get_all_enabled()
-    # Only fetch bugs from real bug-tracking systems
     connectors = [c for c in all_connectors if c.system_type in _BUG_SOURCE_TYPES]
 
     if not connectors:
@@ -232,22 +246,27 @@ async def get_bugs(
             "message": "No connectors configured",
         }
 
-    tasks = {asyncio.create_task(fetch_for_connector(c)): c.source_id for c in connectors}
-    done, pending = await asyncio.wait(tasks.keys(), timeout=25.0)
-
-    for task in pending:
-        task.cancel()
-        print(f"[BugList] Cancelled slow connector: {tasks[task]}", flush=True)
-
+    from orchestrator.redis_client import get_redis
+    import json
+    r = await get_redis()
+    
+    # Query ONLY local Redis ZSET
+    bug_ids = await r.zrevrange("buglist:all:scores", 0, -1)
+    
     all_bugs = []
-    sources_online = 0
-    for task in done:
-        try:
-            _, bugs, _ = task.result()
-            all_bugs.extend(bugs)
-            sources_online += 1
-        except Exception:
-            pass
+    if bug_ids:
+        pipe = r.pipeline()
+        for bid in bug_ids:
+            pipe.hget(f"bug:data:{bid}", "data")
+        results = await pipe.execute()
+        for res in results:
+            if res:
+                try:
+                    all_bugs.append(json.loads(res))
+                except Exception:
+                    pass
+
+    sources_online = len(connectors)
 
     if search:
         sl = search.strip().lower()
@@ -328,8 +347,6 @@ async def get_bugs(
             bug["triage_info"] = None
             bug["is_triaged"] = False
 
-    asyncio.create_task(background_full_fetch(all_connectors))
-
     return {
         "bugs": page_bugs,
         "total": total,
@@ -337,7 +354,7 @@ async def get_bugs(
         "page_size": page_size,
         "sources_online": sources_online,
         "sources_total": len(connectors),
-        "partial": len(pending) > 0,
+        "partial": False,
     }
 
 
@@ -450,8 +467,29 @@ async def get_bug_status(
     live_severity   = live.get("severity", "")
     live_status     = live.get("status", "")
 
+    def to_datetime(val) -> datetime:
+        if isinstance(val, datetime):
+            return val
+        if not val:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            s = str(val).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            if len(s) > 5 and s[-5] in ('+', '-'):
+                s = s[:-2] + ":" + s[-2:]
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    last_triaged_dt = to_datetime(last_triage.created_at)
+    live_updated_dt = to_datetime(live_updated_at)
+
     no_change = (
-        live_updated_at <= ticket_updated_at
+        live_updated_dt <= last_triaged_dt
         and live_severity == last_severity
         and live_status == last_status
     )
@@ -471,7 +509,7 @@ async def get_bug_status(
     try:
         changelog = await asyncio.wait_for(
             connector.get_changelog(
-                bug_id, since=ticket_updated_at),
+                bug_id, since=last_triaged_at),
             timeout=10.0)
     except Exception:
         pass

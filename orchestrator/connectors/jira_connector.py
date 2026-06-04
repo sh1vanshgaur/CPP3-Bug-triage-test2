@@ -10,7 +10,6 @@ JIRA_STATUS_MAP = {
     "closed": "Closed",
     "done": "Closed",
 }
-
 JIRA_PRIORITY_MAP = {
     "blocker": "P0",
     "critical": "P0",
@@ -25,8 +24,6 @@ JIRA_PRIORITY_MAP = {
     "trivial": "P3",
     "minor": "P3",
 }
-
-
 class JiraConnector(BaseConnector):
     def _extract_text_from_adf(self, content) -> str:
         """Recursively extract plain text from Atlassian Document Format (ADF)."""
@@ -118,12 +115,15 @@ class JiraConnector(BaseConnector):
         url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
         params = {"fields": fields, "expand": "changelog"}
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers(), params=params)
                 if resp.status_code == 404:
                     return None
                 resp.raise_for_status()
-                return self._normalise(resp.json())
+                raw_data = resp.json()
+                ticket = self._normalise(raw_data)
+                ticket.direct_reference_links = self.extract_links(raw_data)
+                return ticket
         except Exception:
             return None
 
@@ -142,7 +142,7 @@ class JiraConnector(BaseConnector):
             "fields": fields,
         }
         try:
-            async with httpx.AsyncClient(timeout=22) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.post(
                     f"{self.base_url}/rest/api/2/search",
                     json=payload, headers=self._headers()
@@ -157,7 +157,7 @@ class JiraConnector(BaseConnector):
         url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
         params = {"fields": "updated,priority,status"}
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(url, headers=self._headers(), params=params)
                 if resp.status_code != 200:
                     return {}
@@ -262,7 +262,7 @@ class JiraConnector(BaseConnector):
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         url = f"{self.base_url}/rest/api/2/issue/{ticket_id}/changelog"
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(url, headers=self._headers())
                 resp.raise_for_status()
                 data = resp.json()

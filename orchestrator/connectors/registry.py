@@ -79,6 +79,11 @@ class ConnectorRegistry:
         return _connector_cache
 
     @classmethod
+    async def get_all_connectors(cls) -> list[BaseConnector]:
+        return await cls.get_all_enabled()
+
+
+    @classmethod
     async def get_connector(cls, source_id: str) -> BaseConnector | None:
         connectors = await cls.get_all_enabled()
         for c in connectors:

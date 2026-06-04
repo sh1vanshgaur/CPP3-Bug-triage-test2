@@ -2,8 +2,10 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 import structlog
+import httpx
 from groq import AsyncGroq
 from .base import BaseAgent
 from ..connectors.registry import ConnectorRegistry
@@ -12,74 +14,184 @@ log = structlog.get_logger()
 
 MAX_REACT_ITERS = 4
 
-SYSTEM_PROMPT = """You are an elite triage assistant in a strict
-ReAct loop. Find the most relevant troubleshooting runbooks or
-workarounds for the reported bug.
+# Map source_id family to Apache Confluence space keys
+SOURCE_TO_SPACE = {
+    "spark":      "SPARK",
+    "kafka":      "KAFKA",
+    "flink":      "FLINK",
+    "hadoop":     "HADOOP",
+    "hive":       "HIVE",
+    "hbase":      "HBASE",
+    "zookeeper":  "ZOOKEEPER",
+    "cassandra":  "CASSANDRA",
+    "airflow":    "AIRFLOW",
+}
 
-You have access to:
+SYSTEM_PROMPT = """You are a technical documentation \
+specialist in a strict ReAct loop.
+Find the most relevant troubleshooting articles for the bug.
+
+Tools:
 Action: search_confluence
-Action Input: <2-4 word architectural concept query>
+Action Input: <2-4 word query>
 
 Rules:
-- Think abstractly about the UNDERLYING engineering concept
-- Strip ALL line numbers, hex addresses, thread IDs
-- Examples of good queries:
-  "CTE optimizer incorrect results"
-  "consumer group rebalancing timeout"
-  "OOMKilled memory limit configuration"
-  "StorageController concurrent allocation"
-  "WebGL context lost recovery"
-- If first search returns nothing, try a broader concept
-- Maximum 4 searches total
+- Use DEVELOPER vocabulary not formal descriptions
+- Apache projects: use "apache-rat", "checkstyle",
+  "rat plugin", "license header", "eslintrc"
+- JVM issues: use class name + exception type
+- Config issues: use exact filename
+- If search returns nothing, try a different angle
+- Maximum 4 searches
 
-Output format:
+Format:
 Thought: <reasoning>
 Action: search_confluence
 Action Input: <query>
 
-OR when done:
-Final Answer: [{"title":"...","url":"...","excerpt":"...","relevance":"high|medium|low"}]
+OR:
+Final Answer: [{"title":"...","url":"...",
+"excerpt":"...","relevance":"high|medium|low"}]
 
-Always provide Final Answer as JSON array even if empty."""
+Always provide Final Answer even if empty."""
 
 
 class EnrichmentAgent(BaseAgent):
     step_name = "enrichment"
 
-    async def run(self, context: dict) -> dict:
-        primary = context.get("primary_ticket") or {}
+    def _get_family(self, source_id: str) -> str:
+        s = source_id.lower()
+        for p in ["apache-", "mozilla-", "microsoft-",
+                  "kubernetes-"]:
+            s = s.replace(p, "")
+        for sx in ["-jira", "-github", "-bugzilla"]:
+            s = s.replace(sx, "")
+        return s.strip("-")
 
-        # Use full ticket data — NOT keywords (they are gone)
+    def _get_target_space(self, source_id: str) -> str:
+        family = self._get_family(source_id)
+        return SOURCE_TO_SPACE.get(family, "HPEKB")
+
+    def _extract_initial_query(self, primary: dict) -> str:
+        title     = (primary.get("title") or "")
+        component = (primary.get("component") or "")
+        error     = (primary.get("error_excerpt") or "")[:200]
+
+        # File names: .eslintrc, .stylelintrc, pom.xml
+        files = re.findall(
+            r'\.[\w]+(?:rc|config|yml|yaml|json|js|ts)',
+            title)
+        if files:
+            return files[0][1:]
+
+        # CamelCase class names
+        camel = re.findall(
+            r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b',
+            title + " " + error)
+        if camel:
+            return camel[0]
+
+        # Exception types in error
+        exc = re.findall(
+            r'\b\w+(?:Exception|Error)\b', error)
+        if exc:
+            return exc[0]
+
+        # Component + first meaningful title word
+        stop = {"add", "fix", "update", "remove",
+                "missing", "error", "failed"}
+        words = [
+            w.strip(".,()") for w in title.split()
+            if len(w) > 4
+            and w.lower() not in stop
+        ]
+        if words and component:
+            return f"{component} {words[0]}"
+        if words:
+            return words[0]
+
+        return component or title[:30]
+
+    async def run(self, context: dict) -> dict:
+        primary   = context.get("primary_ticket") or {}
+        source_id = context.get("source_id", "")
+
         title         = (primary.get("title") or "")
         component     = (primary.get("component") or "")
-        description   = (primary.get("description") or "")[:400]
-        error_excerpt = (primary.get("error_excerpt") or "")[:300]
-        status        = (primary.get("status") or "")
+        description   = (primary.get(
+            "description") or "")[:400]
+        error_excerpt = (primary.get(
+            "error_excerpt") or "")[:300]
 
-        groq_api_key   = os.getenv("GROQ_API_KEY", "")
-        # Use fast 8b model for enrichment as per spec
+        groq_api_key    = os.getenv("GROQ_API_KEY", "")
         enrichment_model = "llama-3.1-8b-instant"
 
-        kb_articles = []
+        # Determine correct Confluence space
+        target_space = self._get_target_space(source_id)
+        log.info("Enrichment target space",
+                 source_id=source_id,
+                 space=target_space)
 
-        if not groq_api_key:
-            context["kb_articles"] = []
-            return context
+        # Extract deterministic initial query
+        initial_query = self._extract_initial_query(primary)
+        log.info("Enrichment initial query",
+                 query=initial_query)
 
-        client = AsyncGroq(api_key=groq_api_key)
+        kb_articles  = []
+        so_articles  = []
 
+        # Run Confluence ReAct + Stack Overflow in parallel
+        confluence_task = asyncio.create_task(
+            self._run_react_loop(
+                title, component, description,
+                error_excerpt, initial_query,
+                target_space, groq_api_key,
+                enrichment_model))
+
+        so_task = asyncio.create_task(
+            self._search_stackoverflow(
+                initial_query, title))
+
+        conf_result, so_result = await asyncio.gather(
+            confluence_task, so_task,
+            return_exceptions=True)
+
+        if isinstance(conf_result, list):
+            kb_articles = conf_result
+        if isinstance(so_result, list):
+            so_articles = so_result
+
+        # Merge: confluence first then Stack Overflow
+        all_articles = kb_articles + so_articles
+        log.info("Enrichment complete",
+                 confluence=len(kb_articles),
+                 stackoverflow=len(so_articles),
+                 total=len(all_articles))
+
+        context["kb_articles"] = all_articles[:6]
+        return context
+
+    async def _run_react_loop(
+            self, title: str, component: str,
+            description: str, error_excerpt: str,
+            initial_query: str, target_space: str,
+            api_key: str, model: str) -> list:
+        if not api_key:
+            return []
+
+        client   = AsyncGroq(api_key=api_key)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    f"Find knowledge base articles for this bug:\n"
+                    f"Find articles for this bug:\n"
                     f"Title: {title}\n"
                     f"Component: {component}\n"
                     f"Description: {description}\n"
                     f"Error: {error_excerpt}\n\n"
-                    f"Search for the underlying engineering concept "
-                    f"not the literal error words."
+                    f"Start with this search query: "
+                    f"{initial_query}"
                 ),
             },
         ]
@@ -87,48 +199,48 @@ class EnrichmentAgent(BaseAgent):
         for iteration in range(MAX_REACT_ITERS):
             try:
                 resp = await client.chat.completions.create(
-                    model=enrichment_model,
+                    model=model,
                     messages=messages,
                     temperature=0.0,
                     max_tokens=512,
                 )
-                reply = (resp.choices[0].message.content or "")
-                messages.append(
-                    {"role": "assistant", "content": reply})
+                reply = (
+                    resp.choices[0].message.content or "")
+                messages.append({
+                    "role": "assistant",
+                    "content": reply})
 
                 if "Final Answer:" in reply:
-                    raw = reply.split("Final Answer:")[-1].strip()
-                    raw = raw.strip("```json").strip("```").strip()
+                    raw = reply.split(
+                        "Final Answer:")[-1].strip()
+                    raw = raw.strip(
+                        "```json").strip("```").strip()
                     try:
                         parsed = json.loads(raw)
-                        kb_articles = (parsed
-                                       if isinstance(parsed, list)
-                                       else [])
+                        return (parsed
+                                if isinstance(parsed, list)
+                                else [])
                     except Exception:
-                        kb_articles = []
-                    break
+                        return []
 
                 if ("Action: search_confluence" in reply
                         and "Action Input:" in reply):
-                    query = (reply.split("Action Input:")[-1]
-                             .strip()
-                             .split("\n")[0]
-                             .strip()
-                             .strip('"\''))
-
-                    log.info("Enrichment searching",
-                             query=query,
-                             iteration=iteration)
+                    query = (
+                        reply.split("Action Input:")[-1]
+                        .strip()
+                        .split("\n")[0]
+                        .strip()
+                        .strip('"\''))
 
                     results = await self._search_confluence(
-                        query, context)
+                        query, target_space)
 
                     if not results:
                         obs = (
-                            "No results found. Try a broader "
-                            "architectural concept — remove "
-                            "specific version numbers or "
-                            "class paths.")
+                            f"No results for '{query}' in "
+                            f"{target_space} space. Try a "
+                            f"different technical term or "
+                            f"broader concept.")
                     else:
                         obs = json.dumps(results)
 
@@ -138,151 +250,133 @@ class EnrichmentAgent(BaseAgent):
                     })
 
             except Exception as e:
-                log.warning("Enrichment iteration failed",
+                log.warning("ReAct iteration failed",
                             error=str(e),
                             iteration=iteration)
                 break
 
-        context["kb_articles"] = kb_articles[:5]
-        log.info("Enrichment complete",
-                 articles=len(kb_articles))
-        return context
+        return []
 
-    async def _search_confluence(self, query: str,
-                                  context: dict = None) -> list[dict]:
+    async def _search_confluence(
+            self, query: str,
+            target_space: str) -> list[dict]:
         try:
-            try:
-                # Primary: use get_all_by_type
-                connectors = await ConnectorRegistry.get_all_by_type(
-                    "confluence")
-            except AttributeError:
-                # Fallback: filter manually from get_all_enabled
-                all_c = await ConnectorRegistry.get_all_enabled()
-                connectors = [
-                    c for c in all_c
-                    if (c.system_type or "").lower() == "confluence"
-                    or "confluence" in type(c).__name__.lower()
-                ]
+            connectors = await ConnectorRegistry.get_all_by_type(
+                "confluence")
+            if not connectors:
+                try:
+                    all_c = await ConnectorRegistry.get_all_enabled()
+                    connectors = [
+                        c for c in all_c
+                        if c.system_type == "confluence"
+                    ]
+                except Exception:
+                    return []
 
             if not connectors:
-                log.warning("No confluence connectors found",
-                            hint="Check registry SYSTEM_TYPE_TO_CLASS "
-                                 "has confluence key")
                 return []
 
-            log.info("Enrichment: confluence connectors loaded",
-                     count=len(connectors),
-                     sources=[c.source_id for c in connectors])
+            # Find connector matching target space
+            # Fall back to first confluence connector
+            target_connector = None
+            for c in connectors:
+                if (c.project_key or "").upper() == (
+                        target_space.upper()):
+                    target_connector = c
+                    break
+            if not target_connector:
+                target_connector = connectors[0]
 
-            all_results = []
-            seen_titles: set = set()
+            results = await asyncio.wait_for(
+                target_connector.search(
+                    query, max_results=5),
+                timeout=15.0)
 
-            primary = (context or {}).get("primary_ticket") or {}
-            bug_text = (
-                f"{primary.get('title','')} "
-                f"{primary.get('component','')} "
-                f"{primary.get('error_excerpt','')[:200]}"
-            ).strip()
+            output = []
+            for t in results:
+                article_text = t.description or ""
+                chunks       = self._slice_and_score(
+                    article_text, query, 0)
+                excerpt      = " ... ".join(chunks)[:400]
+                output.append({
+                    "title":     t.title,
+                    "url":       t.url,
+                    "excerpt":   excerpt,
+                    "relevance": "medium",
+                    "source":    "confluence",
+                })
+            log.info("Confluence search",
+                     query=query,
+                     space=target_space,
+                     count=len(output))
+            return output
 
-            for connector in connectors:
-                try:
-                    results = await asyncio.wait_for(
-                        connector.search(query, max_results=5),
-                        timeout=15.0)
-
-                    for t in results:
-                        if t.title in seen_titles:
-                            continue
-                        seen_titles.add(t.title)
-
-                        article_text = t.description or ""
-                        chunks = self._slice_and_score(
-                            article_text, bug_text, 0)
-                        excerpt = " ... ".join(chunks)[:400]
-
-                        # Use the connector's own base_url
-                        # for the article link
-                        article_url = self._make_article_url(
-                            connector, t.url)
-
-                        all_results.append({
-                            "title":     t.title,
-                            "url":       article_url,
-                            "excerpt":   excerpt,
-                            "relevance": "medium",
-                            "source":    connector.source_id,
-                        })
-
-                    log.info("Confluence result",
-                             source=connector.source_id,
-                             query=query,
-                             found=len(results))
-
-                except asyncio.TimeoutError:
-                    log.warning("Confluence timeout",
-                                source=connector.source_id)
-                except Exception as e:
-                    log.warning("Confluence error",
-                                source=connector.source_id,
-                                error=str(e))
-
-            # Sort: articles with query words in title first
-            q_lower = query.lower()
-            all_results.sort(
-                key=lambda x: q_lower in x.get(
-                    "title", "").lower(),
-                reverse=True)
-
-            return all_results[:5]
-
+        except asyncio.TimeoutError:
+            log.warning("Confluence timeout",
+                        query=query)
+            return []
         except Exception as e:
-            log.warning("_search_confluence error", error=str(e))
+            log.warning("Confluence error",
+                        error=str(e))
             return []
 
-    def _make_article_url(self, connector, raw_url: str) -> str:
-        """
-        Build correct article URL using the connector's
-        own base_url — not a hardcoded domain.
-        Sanitize localhost/mock domains only.
-        """
-        bad_domains = [
-            "confluence.example.com",
-            "localhost",
-            "127.0.0.1",
-            "0.0.0.0",
-            "example.com",
-        ]
+    async def _search_stackoverflow(
+            self, query: str,
+            title: str) -> list[dict]:
+        try:
+            search_q = query or title[:50]
+            url      = "https://api.stackexchange.com/2.3/search"
+            params   = {
+                "order":    "desc",
+                "sort":     "relevance",
+                "intitle":  search_q,
+                "site":     "stackoverflow",
+                "pagesize": 5,
+            }
+            async with httpx.AsyncClient(
+                    timeout=10,
+                    follow_redirects=True) as client:
+                resp = await client.get(
+                    url, params=params)
+                if resp.status_code != 200:
+                    return []
+                items   = resp.json().get("items", [])
+                results = []
+                for item in items:
+                    score     = item.get("score", 0)
+                    answered  = item.get("is_answered",
+                                         False)
+                    relevance = (
+                        "high"
+                        if answered and score > 5
+                        else "medium"
+                        if answered
+                        else "low")
+                    results.append({
+                        "title":     item.get("title", ""),
+                        "url":       (
+                            "https://stackoverflow.com"
+                            f"/questions/"
+                            f"{item.get('question_id')}"),
+                        "excerpt":   (
+                            f"Score: {score} | "
+                            f"Answered: {answered} | "
+                            f"Tags: "
+                            f"{', '.join(item.get('tags', [])[:4])}"),
+                        "relevance": relevance,
+                        "source":    "stackoverflow",
+                    })
+                log.info("StackOverflow search",
+                         query=search_q,
+                         count=len(results))
+                return results
+        except Exception as e:
+            log.warning("StackOverflow error",
+                        error=str(e))
+            return []
 
-        # If it is already a good absolute URL, return it
-        if raw_url and raw_url.startswith("http"):
-            for bad in bad_domains:
-                if bad in raw_url:
-                    break
-            else:
-                return raw_url  # URL is clean, use as-is
-
-        # Extract path and rebuild using connector's base_url
-        base = connector.base_url.rstrip("/")
-        if not raw_url:
-            return base
-
-        path = raw_url
-        if raw_url.startswith("http"):
-            try:
-                from urllib.parse import urlparse
-                path = urlparse(raw_url).path
-            except Exception:
-                path = "/"
-
-        if not path.startswith("/"):
-            path = "/" + path
-
-        # Remove duplicate /wiki if present
-        if "/confluence" in base and path.startswith("/wiki"):
-            return f"{base}{path[5:]}"
-        return f"{base}{path}"
-
-    def _slice_and_score(self, article_text: str,
+    def _slice_and_score(self,
+                          article_text: str,
                           bug_text: str,
                           last_modified_epoch: float = 0
                           ) -> list[str]:
@@ -302,20 +396,19 @@ class EnrichmentAgent(BaseAgent):
             decay = 0.9
 
         bug_words = set(bug_text.lower().split())
-        scored = []
+        scored    = []
         for chunk in paragraphs:
-            cwords = set(chunk.lower().split())
+            cwords  = set(chunk.lower().split())
             if not cwords:
                 continue
-            overlap = (len(bug_words & cwords)
-                       / len(bug_words | cwords))
+            overlap  = (len(bug_words & cwords)
+                        / len(bug_words | cwords))
             adjusted = overlap * decay
-            has_signal = any(
+            has_fix  = any(
                 kw in chunk.lower()
                 for kw in ("workaround", "patch", "fix",
-                           "resolution", "solution", "error",
-                           "exception", "failed"))
-            if adjusted >= 0.08 or has_signal:
+                           "resolution", "solution"))
+            if adjusted >= 0.08 or has_fix:
                 scored.append((adjusted, chunk))
 
         scored.sort(key=lambda x: x[0], reverse=True)

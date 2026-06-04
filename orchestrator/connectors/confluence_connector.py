@@ -51,10 +51,11 @@ class ConfluenceConnector(BaseConnector):
         Remove HTML/XHTML tags, decode entities,
         normalize whitespace, cap at 2000 chars.
         """
+        import html
         # Remove HTML tags (non-greedy)
         clean = re.sub(r'<[^>]+?>', ' ', text or '')
-        # Decode common HTML entities
-        clean = re.sub(r'&[a-zA-Z0-9#]+;', ' ', clean)
+        # Decode all HTML entities
+        clean = html.unescape(clean)
         # Normalize whitespace
         clean = re.sub(r'[\s\t\n\r]+', ' ', clean).strip()
         return clean[:2000]
@@ -69,19 +70,26 @@ class ConfluenceConnector(BaseConnector):
             "example.com",
         ]
 
+        corp_url = os.getenv("CONFLUENCE_URL", "https://cpp3-hpe.atlassian.net/wiki").rstrip("/")
+
         # Best case: API gave us the base URL directly
         # links_base + webui_path is always the correct URL
         if links_base and webui_path:
             clean_base = links_base.rstrip("/")
-            is_bad = any(b in clean_base for b in bad_domains)
-            if not is_bad:
-                return f"{clean_base}{webui_path}"
+            if any(b in clean_base for b in bad_domains):
+                clean_base = corp_url
+            path = webui_path.strip()
+            if not path.startswith("/"):
+                path = "/" + path
+            if clean_base.endswith("/wiki") and path.startswith("/wiki"):
+                return f"{clean_base}{path[5:]}"
+            return f"{clean_base}{path}"
 
         # Fallback: reconstruct from self.base_url
         base = self.base_url.rstrip("/")
         # Sanitize mock base
         if any(b in base for b in bad_domains):
-            base = "https://cpp3-hpe.atlassian.net/wiki"
+            base = corp_url
 
         if not webui_path:
             return base

@@ -21,6 +21,7 @@ class TicketData:
     comments: list = field(default_factory=list)
     linked_items: list = field(default_factory=list)
     labels: list = field(default_factory=list)
+    direct_reference_links: list = field(default_factory=list)
 
 
 @dataclass

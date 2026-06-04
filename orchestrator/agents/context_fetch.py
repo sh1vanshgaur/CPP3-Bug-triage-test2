@@ -142,6 +142,7 @@ class ContextFetchAgent(BaseAgent):
         context["components"]      = (
             [ticket.component] if ticket.component else [])
         context["source_id"]       = connector.source_id
+        context["direct_reference_links"] = getattr(ticket, "direct_reference_links", [])
 
         log.info("ContextFetch complete",
                  bug_id=bug_id,
