@@ -59,6 +59,22 @@ Always provide Final Answer even if empty."""
 class EnrichmentAgent(BaseAgent):
     step_name = "enrichment"
 
+    SOURCE_SPACE_MAP = {
+        "apache-flink":     "FLINK",
+        "flink":            "FLINK",
+        "apache-spark":     "SPARK",
+        "spark":            "SPARK",
+        "kafka":            "KAFKA",
+        "apache-kafka":     "KAFKA",
+        "hpe":              "HPEKB",
+        "hpekb":            "HPEKB",
+        "hadoop":           "HADOOP",
+        "apache-hadoop":    "HADOOP",
+        "zookeeper":        "ZOOKEEPER",
+        "apache-zookeeper": "ZOOKEEPER",
+    }
+    DEFAULT_SPACE = "HPEKB"
+
     def _get_family(self, source_id: str) -> str:
         s = source_id.lower()
         for p in ["apache-", "mozilla-", "microsoft-",
@@ -72,45 +88,39 @@ class EnrichmentAgent(BaseAgent):
         family = self._get_family(source_id)
         return SOURCE_TO_SPACE.get(family, "HPEKB")
 
-    def _extract_initial_query(self, primary: dict) -> str:
-        title     = (primary.get("title") or "")
-        component = (primary.get("component") or "")
-        error     = (primary.get("error_excerpt") or "")[:200]
+    def _resolve_target_space(self, source_id: str) -> str:
+        s = source_id.lower().rstrip("0123456789-")
+        for key, space in self.SOURCE_SPACE_MAP.items():
+            if s.startswith(key) or key in s:
+                return space
+        return self.DEFAULT_SPACE
 
-        # File names: .eslintrc, .stylelintrc, pom.xml
+    def _extract_initial_query(self,
+                               ticket_title: str,
+                               ticket_description: str) -> str:
+        # Rule 1: file extension pattern
         files = re.findall(
-            r'\.[\w]+(?:rc|config|yml|yaml|json|js|ts)',
-            title)
+            r'\.[\w]+(?:rc|config|yml|yaml|json|js|ts|xml|toml)',
+            ticket_title)
         if files:
             return files[0][1:]
 
-        # CamelCase class names
+        # Rule 2: CamelCase word
         camel = re.findall(
-            r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b',
-            title + " " + error)
+            r'\b[A-Z][a-z]+[A-Z][a-zA-Z]+\b', ticket_title)
         if camel:
             return camel[0]
 
-        # Exception types in error
+        # Rule 3: Exception/Error/Failure suffix
         exc = re.findall(
-            r'\b\w+(?:Exception|Error)\b', error)
+            r'\b\w+(?:Exception|Error|Failure)\b', ticket_title)
         if exc:
             return exc[0]
 
-        # Component + first meaningful title word
-        stop = {"add", "fix", "update", "remove",
-                "missing", "error", "failed"}
+        # Rule 4: first 4 words of title
         words = [
-            w.strip(".,()") for w in title.split()
-            if len(w) > 4
-            and w.lower() not in stop
-        ]
-        if words and component:
-            return f"{component} {words[0]}"
-        if words:
-            return words[0]
-
-        return component or title[:30]
+            w.strip(".,()[]\"'") for w in ticket_title.split()]
+        return " ".join(words[:4])
 
     async def run(self, context: dict) -> dict:
         primary   = context.get("primary_ticket") or {}
@@ -127,13 +137,14 @@ class EnrichmentAgent(BaseAgent):
         enrichment_model = "llama-3.1-8b-instant"
 
         # Determine correct Confluence space
-        target_space = self._get_target_space(source_id)
+        target_space = self._resolve_target_space(source_id)
         log.info("Enrichment target space",
                  source_id=source_id,
                  space=target_space)
 
         # Extract deterministic initial query
-        initial_query = self._extract_initial_query(primary)
+        initial_query = self._extract_initial_query(
+            title, description)
         log.info("Enrichment initial query",
                  query=initial_query)
 
@@ -198,6 +209,34 @@ class EnrichmentAgent(BaseAgent):
 
         for iteration in range(MAX_REACT_ITERS):
             try:
+                # Iteration 0: deterministic initial search,
+                # bypass LLM to eliminate one round-trip
+                if iteration == 0:
+                    query = initial_query
+                    messages.append({
+                        "role": "assistant",
+                        "content": (
+                            f"Thought: Starting with "
+                            f"deterministic query.\n"
+                            f"Action: search_confluence\n"
+                            f"Action Input: {query}"),
+                    })
+                    results = await self._search_confluence(
+                        query, target_space)
+                    if not results:
+                        obs = (
+                            f"No results for '{query}' in "
+                            f"{target_space} space. Try a "
+                            f"different technical term or "
+                            f"broader concept.")
+                    else:
+                        obs = json.dumps(results)
+                    messages.append({
+                        "role": "user",
+                        "content": f"Observation: {obs}",
+                    })
+                    continue
+
                 resp = await client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -259,7 +298,7 @@ class EnrichmentAgent(BaseAgent):
 
     async def _search_confluence(
             self, query: str,
-            target_space: str) -> list[dict]:
+            target_space: str = None) -> list[dict]:
         try:
             connectors = await ConnectorRegistry.get_all_by_type(
                 "confluence")
@@ -279,11 +318,12 @@ class EnrichmentAgent(BaseAgent):
             # Find connector matching target space
             # Fall back to first confluence connector
             target_connector = None
-            for c in connectors:
-                if (c.project_key or "").upper() == (
-                        target_space.upper()):
-                    target_connector = c
-                    break
+            if target_space:
+                for c in connectors:
+                    if (c.project_key or "").upper() == (
+                            target_space.upper()):
+                        target_connector = c
+                        break
             if not target_connector:
                 target_connector = connectors[0]
 
