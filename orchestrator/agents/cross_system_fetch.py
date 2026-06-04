@@ -7,8 +7,18 @@ from groq import AsyncGroq
 from .base import BaseAgent
 from ..connectors.registry import ConnectorRegistry
 from ..models.synthesis import CandidateScore
+from ..utils.url_utils import sanitize_bug_url
 
 log = structlog.get_logger()
+
+STOP_WORDS = {
+    "a", "an", "the", "to", "with", "when", "in", "on", "at", "by",
+    "for", "of", "and", "or", "is", "it", "this", "that", "was",
+    "are", "be", "as", "from", "but", "not", "have", "has", "had",
+    "he", "she", "they", "we", "you", "i", "its", "if", "so", "do",
+    "did", "will", "would", "could", "should", "may", "might", "can",
+    "error", "issue", "bug", "fix", "update", "add", "remove", "change",
+}
 
 
 class CrossSystemFetchAgent(BaseAgent):
@@ -18,15 +28,8 @@ class CrossSystemFetchAgent(BaseAgent):
         primary        = context.get("primary_ticket") or {}
         primary_source = context.get("source_id", "")
 
-        if not primary:
-            log.warning("CrossSystem: no primary ticket")
-            context["related_tickets"]    = []
-            context["sources_queried"]    = []
-            context["related_candidates"] = []
-            return context
-
-        if not primary.get("title"):
-            log.warning("CrossSystem: primary ticket empty")
+        if not primary or not primary.get("title"):
+            log.warning("CrossSystem: no primary ticket or title")
             context["related_tickets"]    = []
             context["sources_queried"]    = []
             context["related_candidates"] = []
@@ -51,35 +54,67 @@ class CrossSystemFetchAgent(BaseAgent):
             and w.lower().strip(".,()[]") not in _stop
         ))[:8]
 
-        # LEVEL 1: Backlink extraction
+        # Fetch connectors once — used for backlink URL construction and Level 3
+        all_connectors = await ConnectorRegistry.get_all_enabled()
+        jira_base = next(
+            (c.base_url for c in all_connectors
+             if "jira" in (c.system_type or "").lower()), "")
+        github_base = next(
+            (c.base_url for c in all_connectors
+             if c.system_type == "github"), "https://api.github.com")
+        github_repo = next(
+            (c.project_key for c in all_connectors
+             if c.system_type == "github"), "")
+        bugzilla_base = next(
+            (c.base_url for c in all_connectors
+             if c.system_type == "bugzilla"), "")
+
+        # LEVEL 1: Backlink extraction with real URLs
         backlinks  = self._extract_backlinks(description, comments)
         candidates = []
         for jira_id in backlinks["jira"]:
+            url = f"{jira_base}/browse/{jira_id}" if jira_base else ""
             candidates.append({
-                "id":            jira_id,
-                "source":        "jira",
-                "from_backlink": True,
-                "title":         jira_id,
-                "description":   "",
-                "overlap_score": 999,
+                "id":              jira_id,
+                "source":          "jira",
+                "from_backlink":   True,
+                "title":           jira_id,
+                "description":     "",
+                "url":             url,
+                "relevance_score": 1.0,
+                "similarity_score": 1.0,
+                "similarity_label":  "Direct Reference",
+                "similarity_reason": "Explicitly referenced in ticket text",
             })
         for gh_id in backlinks["github"]:
+            url = (f"https://github.com/{github_repo}/issues/{gh_id}"
+                   if github_repo else "")
             candidates.append({
-                "id":            f"#{gh_id}",
-                "source":        "github",
-                "from_backlink": True,
-                "title":         f"GitHub #{gh_id}",
-                "description":   "",
-                "overlap_score": 999,
+                "id":              f"#{gh_id}",
+                "source":          "github",
+                "from_backlink":   True,
+                "title":           f"GitHub #{gh_id}",
+                "description":     "",
+                "url":             url,
+                "relevance_score": 1.0,
+                "similarity_score": 1.0,
+                "similarity_label":  "Direct Reference",
+                "similarity_reason": "Explicitly referenced in ticket text",
             })
         for bz_id in backlinks["bugzilla"]:
+            url = (f"{bugzilla_base}/show_bug.cgi?id={bz_id}"
+                   if bugzilla_base else "")
             candidates.append({
-                "id":            f"BZ-{bz_id}",
-                "source":        "bugzilla",
-                "from_backlink": True,
-                "title":         f"BZ-{bz_id}",
-                "description":   "",
-                "overlap_score": 999,
+                "id":              f"BZ-{bz_id}",
+                "source":          "bugzilla",
+                "from_backlink":   True,
+                "title":           f"BZ-{bz_id}",
+                "description":     "",
+                "url":             url,
+                "relevance_score": 1.0,
+                "similarity_score": 1.0,
+                "similarity_label":  "Direct Reference",
+                "similarity_reason": "Explicitly referenced in ticket text",
             })
         log.info("CrossSystem backlinks found",
                  jira=len(backlinks["jira"]),
@@ -99,26 +134,107 @@ class CrossSystemFetchAgent(BaseAgent):
             candidates.extend(scored)
 
         # LEVEL 3: Live API search — only if < 2 unique candidates
-        total_unique = len({c["id"] for c in candidates})
+        total_unique = len({c.get("id", "") for c in candidates if c.get("id")})
+        sources_queried = []
         if total_unique < 2:
             log.warning(
                 "Levels 1+2 returned fewer than 2 candidates. "
                 "Falling back to live API search.")
             live_results, sources_queried = await self._live_api_search(
-                primary, primary_source, context)
+                primary, primary_source, context,
+                all_connectors=all_connectors)
             candidates.extend(live_results)
-            context["related_tickets"]  = live_results
-            context["sources_queried"]  = sources_queried
-        else:
-            context["related_tickets"]  = candidates
-            context["sources_queried"]  = []
 
-        context["related_candidates"] = candidates
+        # Normalize ALL candidates to the standard shape and deduplicate by id
+        seen_ids: set[str] = set()
+        normalized: list[dict] = []
+        for c in candidates:
+            n = self._normalize_candidate(c)
+            cid = n["id"]
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                normalized.append(n)
+
+        normalized.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+        context["related_tickets"]    = normalized
+        context["sources_queried"]    = sources_queried
+        context["related_candidates"] = normalized
         return context
+
+    # ── Candidate normalization ───────────────────────────────────
+    def _normalize_candidate(self, raw: dict) -> dict:
+        """
+        Converts any candidate dict (Level 1 backlinks, Level 2 Redis/Groq,
+        or Level 3 live API) into the standard shape the frontend expects:
+        id, title, url, status, source, description, relevance_score.
+        """
+        id_ = (
+            raw.get("id") or
+            raw.get("ticket_id") or
+            raw.get("key") or ""
+        )
+        source = (
+            raw.get("system_type") or
+            raw.get("source") or
+            raw.get("source_id") or "unknown"
+        )
+        # GitHub IDs are plain numbers from the API; prefix with # for display
+        if ("github" in (source or "").lower()
+                and id_
+                and not str(id_).startswith("#")):
+            id_ = f"#{id_}"
+
+        url = (
+            raw.get("url") or
+            raw.get("html_url") or
+            raw.get("link") or ""
+        )
+        url = sanitize_bug_url(url=str(url), system_type=source, bug_id=id_)
+
+        # Accept either field name for the relevance score
+        score_val = raw.get("relevance_score")
+        if score_val is None:
+            score_val = raw.get("similarity_score")
+        raw_score = float(score_val or 0.0)
+        # Clamp: LLM may return 0-10 scale; always store as 0.0-1.0
+        score = round(max(0.0, min(1.0,
+            raw_score / 10.0 if raw_score > 1.0 else raw_score)), 2)
+
+        status = (raw.get("status") or raw.get("state") or "unknown").lower()
+
+        return {
+            "id":               id_,
+            "ticket_id":        id_,     # backward-compat alias
+            "title":            (raw.get("title") or raw.get("summary")
+                                 or raw.get("name") or ""),
+            "url":              url,
+            "status":           status,
+            "source":           source,
+            "system_type":      source,  # backward-compat alias
+            "description":      (raw.get("description") or
+                                 raw.get("body") or "")[:300],
+            "relevance_score":  score,
+            "similarity_score": score,   # alias
+            "similarity_label":  (raw.get("similarity_label") or ""),
+            "similarity_reason": (raw.get("similarity_reason") or
+                                  raw.get("reason") or ""),
+        }
 
     # ── Redis cache scan (Level 2) ────────────────────────────────
     async def _scan_redis_cache(self,
                                  keywords: list[str]) -> list[dict]:
+        # Strip stop-words before scanning — prevents noise matches on
+        # generic terms like "error", "fix", "update".
+        meaningful_keywords = [
+            k for k in keywords
+            if k.lower() not in STOP_WORDS and len(k) > 2
+        ]
+        if not meaningful_keywords:
+            log.warning("CrossSystem: all keywords were stop-words, "
+                        "skipping redis scan")
+            return []
+
         try:
             from ..redis_client import get_redis
             r    = await get_redis()
@@ -133,23 +249,35 @@ class CrossSystemFetchAgent(BaseAgent):
                     if not isinstance(bug_list, list):
                         continue
                     for bug in bug_list:
-                        text    = (
+                        text = (
                             (bug.get("title") or "") + " " +
                             (bug.get("description") or "")
                         ).lower()
                         overlap = sum(
-                            1 for kw in keywords if kw in text)
+                            1 for kw in meaningful_keywords
+                            if kw in text)
                         if overlap >= 1:
+                            bug_id = (
+                                bug.get("ticket_id") or
+                                bug.get("id") or "")
+                            system_type = (
+                                bug.get("system_type") or
+                                bug.get("source_id") or "unknown")
+                            # Sanitize URL at read time (belt-and-suspenders)
+                            clean_url = sanitize_bug_url(
+                                url=bug.get("url", ""),
+                                system_type=system_type,
+                                bug_id=bug_id,
+                            )
                             hits.append({
-                                "id":           (
-                                    bug.get("ticket_id") or
-                                    bug.get("id") or ""),
-                                "title":        bug.get("title") or "",
-                                "description":  (
+                                "id":            bug_id,
+                                "ticket_id":     bug_id,
+                                "title":         bug.get("title") or "",
+                                "description":   (
                                     bug.get("description") or "")[:300],
-                                "source":       (
-                                    bug.get("system_type") or
-                                    bug.get("source_id") or "unknown"),
+                                "source":        system_type,
+                                "system_type":   system_type,
+                                "url":           clean_url,
                                 "overlap_score": overlap,
                             })
                 except Exception:
@@ -169,14 +297,46 @@ class CrossSystemFetchAgent(BaseAgent):
             self,
             source_ticket: dict,
             candidates: list[dict]) -> list[dict]:
+        MIN_RELEVANCE_SCORE = 0.5  # normalized 0.0-1.0
+
+        def _normalize(raw: float) -> float:
+            """Groq returns 0-10; frontend expects 0.0-1.0."""
+            if isinstance(raw, (int, float)) and raw > 1.0:
+                return round(raw / 10.0, 2)
+            return round(float(raw), 2)
+
+        def _label(score: float) -> str:
+            if score >= 0.8:
+                return "Very Similar"
+            if score >= 0.6:
+                return "Similar"
+            return "Possible"
+
+        def _alias_fields(c: dict) -> dict:
+            """Map Level-2 field names to the Level-3 / TriagePage convention."""
+            c.setdefault("ticket_id", c.get("id", ""))
+            c.setdefault("system_type", c.get("source", ""))
+            score = c.get("relevance_score", 0.0)
+            c["similarity_score"]  = score
+            c["similarity_reason"] = c.get("reason", "")
+            c["similarity_label"]  = _label(score)
+            return c
+
         groq_api_key = os.getenv("GROQ_API_KEY", "")
         if not groq_api_key:
+            result = []
             for c in candidates:
-                c["relevance_score"] = 5.0
-            return sorted(
-                candidates,
-                key=lambda x: x.get("overlap_score", 0),
-                reverse=True)[:10]
+                c["relevance_score"] = _normalize(
+                    c.get("overlap_score", 0))
+                if c["relevance_score"] >= MIN_RELEVANCE_SCORE:
+                    result.append(_alias_fields(c))
+            result.sort(
+                key=lambda x: x.get("relevance_score", 0),
+                reverse=True)
+            if not result:
+                log.info("All Level 2 candidates scored below "
+                         "threshold (no-key path) — returning empty")
+            return result[:10]
 
         cands_text = ""
         for i, c in enumerate(candidates):
@@ -219,7 +379,7 @@ class CrossSystemFetchAgent(BaseAgent):
                 try:
                     score_map[str(item["id"])] = {
                         "relevance_score": float(
-                            item.get("relevance_score", 5)),
+                            item.get("relevance_score", 0)),
                         "reason": str(item.get("reason", "")),
                     }
                 except Exception:
@@ -228,34 +388,53 @@ class CrossSystemFetchAgent(BaseAgent):
             for c in candidates:
                 sid = str(c["id"])
                 if sid in score_map:
-                    c["relevance_score"] = (
+                    c["relevance_score"] = _normalize(
                         score_map[sid]["relevance_score"])
                     c["reason"] = score_map[sid]["reason"]
                 else:
-                    c["relevance_score"] = 5.0
+                    # Not scored by Groq — exclude rather than
+                    # assign a phantom 0.5
+                    c["relevance_score"] = 0.0
+                    c["reason"] = ""
 
-            candidates.sort(
+            # Normalize and threshold filter
+            scored_candidates = [
+                c for c in candidates
+                if c.get("relevance_score", 0) >= MIN_RELEVANCE_SCORE
+            ]
+            scored_candidates.sort(
                 key=lambda x: x.get("relevance_score", 0),
                 reverse=True)
-            return candidates[:10]
+
+            if not scored_candidates:
+                log.info("All Level 2 candidates scored below "
+                         "threshold — returning empty list")
+                return []
+
+            return [_alias_fields(c)
+                    for c in scored_candidates[:10]]
 
         except Exception as e:
             log.warning("CrossSystem Groq cache scoring failed",
                         error=str(e))
+            result = []
             for c in candidates:
-                c["relevance_score"] = float(
-                    c.get("overlap_score", 5))
-            candidates.sort(
+                c["relevance_score"] = round(
+                    min(c.get("overlap_score", 0) / 10.0, 1.0), 2)
+                if c["relevance_score"] >= MIN_RELEVANCE_SCORE:
+                    result.append(_alias_fields(c))
+            result.sort(
                 key=lambda x: x.get("relevance_score", 0),
                 reverse=True)
-            return candidates[:10]
+            return result[:10]
 
     # ── Live API search (Level 3 fallback) ───────────────────────
     async def _live_api_search(
             self,
             primary: dict,
             primary_source: str,
-            context: dict) -> tuple[list, list]:
+            context: dict,
+            all_connectors: list | None = None) -> tuple[list, list]:
         groq_api_key = os.getenv("GROQ_API_KEY", "")
         groq_model   = os.getenv(
             "GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -267,8 +446,9 @@ class CrossSystemFetchAgent(BaseAgent):
                  queries=query_map,
                  source=primary_source)
 
-        # Step B: Select target connectors
-        all_connectors = await ConnectorRegistry.get_all_enabled()
+        # Step B: Select target connectors (reuse pre-fetched list when available)
+        if all_connectors is None:
+            all_connectors = await ConnectorRegistry.get_all_enabled()
         targets = self._select_targets(
             all_connectors, primary_source)
         log.info("CrossSystem targets",
@@ -280,7 +460,7 @@ class CrossSystemFetchAgent(BaseAgent):
 
         # Step C: Parallel search with platform-specific queries
         async def search_one(connector):
-            ctype     = type(connector).__name__.lower()
+            ctype     = (connector.system_type or "").lower()
             source_id = connector.source_id
             is_sister = (self._get_family(source_id) ==
                          self._get_family(primary_source))
@@ -590,11 +770,10 @@ Output JSON only:
     def _select_targets(self,
                         all_connectors: list,
                         primary_source_id: str) -> list:
-        excluded = {"confluence", "customer_portal"}
         candidates = [
             c for c in all_connectors
             if c.source_id != primary_source_id
-            and c.system_type not in excluded
+            and getattr(c, "is_bug_source", False)
         ]
         if not candidates:
             return []
@@ -648,16 +827,15 @@ Output JSON only:
             primary_source: str) -> list:
         co_refs  = context.get("co_references") or []
         hits     = []
-        excluded = {"confluence", "customer_portal"}
 
         for ref in co_refs[:5]:
             for c in all_connectors:
                 if (c.source_id == primary_source
-                        or c.system_type in excluded):
+                        or not getattr(c, "is_bug_source", False)):
                     continue
                 try:
                     t = await asyncio.wait_for(
-                        c.get(ref["raw_id"]),
+                        c.get_ticket(ref["raw_id"]),
                         timeout=8.0)
                     if t:
                         td = dataclasses.asdict(t)

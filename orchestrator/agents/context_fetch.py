@@ -43,7 +43,7 @@ class ContextFetchAgent(BaseAgent):
         ticket = None
         try:
             ticket = await asyncio.wait_for(
-                connector.get(bug_id), timeout=15.0)
+                connector.get_ticket(bug_id), timeout=15.0)
         except asyncio.TimeoutError:
             log.error("ContextFetch: GET timed out", bug_id=bug_id)
             self._add_error(context, f"Timeout fetching {bug_id}")
@@ -106,14 +106,25 @@ class ContextFetchAgent(BaseAgent):
         # ── Fetch customer cases ──────────────────────────────────
         customer_cases = []
         try:
-            portal = await ConnectorRegistry.get_by_type(
+            portals = await ConnectorRegistry.get_all_by_type(
                 "customer_portal")
-            if portal:
+            if portals:
                 q = (f"{ticket.title} "
                      f"{ticket.component or ''}").strip()
-                results = await asyncio.wait_for(
-                    portal.search(q, max_results=3),
-                    timeout=5.0)
+                gathered = await asyncio.gather(
+                    *[
+                        asyncio.wait_for(
+                            portal.search(q, max_results=3),
+                            timeout=5.0)
+                        for portal in portals
+                    ],
+                    return_exceptions=True,
+                )
+                results = []
+                for item in gathered:
+                    if isinstance(item, Exception):
+                        continue
+                    results.extend(item)
                 customer_cases = [
                     {
                         "case_id":  t.ticket_id,
@@ -126,7 +137,8 @@ class ContextFetchAgent(BaseAgent):
                     for t in results
                 ]
                 log.info("ContextFetch: customer cases",
-                         count=len(customer_cases))
+                         count=len(customer_cases),
+                         portals=len(portals))
         except Exception as e:
             log.warning("ContextFetch: portal failed", err=str(e))
 
@@ -134,6 +146,9 @@ class ContextFetchAgent(BaseAgent):
         ticket_dict = dataclasses.asdict(ticket)
         ticket_dict["description"]   = desc
         ticket_dict["error_excerpt"] = err
+        # Normalized aliases so downstream agents don't need to know field spellings
+        ticket_dict["id"]     = ticket_dict["ticket_id"]
+        ticket_dict["source"] = ticket_dict["system_type"]
 
         context["primary_ticket"]  = ticket_dict
         context["linked_items"]    = linked_items
@@ -157,43 +172,20 @@ class ContextFetchAgent(BaseAgent):
         # 1. Direct source_id match
         if source_id:
             try:
-                c = await ConnectorRegistry.get_connector(source_id)
+                c = await ConnectorRegistry.get(source_id)
                 if c:
                     return c
             except Exception:
                 pass
 
-        # 2. Longest-prefix-first match
+        # 2. Registry-owned ticket prefix match
         try:
-            all_connectors = await ConnectorRegistry.get_all_enabled()
+            connector = await ConnectorRegistry.get_by_ticket_id(bug_id)
+            if connector:
+                return connector
         except Exception as e:
             log.error("ContextFetch: registry failed", err=str(e))
             return None
-
-        excluded = {"confluence", "customer_portal"}
-        candidates = [
-            c for c in all_connectors
-            if c.system_type not in excluded
-        ]
-
-        bug_upper = bug_id.upper()
-        candidates.sort(
-            key=lambda c: len(c.ticket_prefix or ""),
-            reverse=True)
-
-        for c in candidates:
-            prefix = (c.ticket_prefix or "").upper().strip()
-            if prefix and bug_upper.startswith(prefix):
-                log.info("ContextFetch: prefix match",
-                         prefix=prefix,
-                         connector=c.source_id)
-                return c
-
-        # 3. Numeric ID → first GitHub connector
-        if bug_id.isdigit():
-            for c in candidates:
-                if "github" in (c.system_type or "").lower():
-                    return c
 
         return None
 
