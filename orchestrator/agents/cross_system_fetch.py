@@ -15,31 +15,247 @@ class CrossSystemFetchAgent(BaseAgent):
     step_name = "cross_system_fetch"
 
     async def run(self, context: dict) -> dict:
-        primary = context.get("primary_ticket") or {}
+        primary        = context.get("primary_ticket") or {}
         primary_source = context.get("source_id", "")
 
         if not primary:
             log.warning("CrossSystem: no primary ticket")
-            context["related_tickets"] = []
-            context["sources_queried"] = []
+            context["related_tickets"]    = []
+            context["sources_queried"]    = []
+            context["related_candidates"] = []
             return context
 
         if not primary.get("title"):
             log.warning("CrossSystem: primary ticket empty")
-            context["related_tickets"] = []
-            context["sources_queried"] = []
+            context["related_tickets"]    = []
+            context["sources_queried"]    = []
+            context["related_candidates"] = []
             return context
 
-        # Phase 2: Extract backlinks from ticket text
-        backlink_candidates = self._extract_backlinks(
-            primary.get("description", ""),
-            primary.get("comments", []))
-        log.info("CrossSystem backlinks found",
-                 jira=len(backlink_candidates["jira"]),
-                 github=len(backlink_candidates["github"]),
-                 bugzilla=len(backlink_candidates["bugzilla"]))
-        context["backlink_candidates"] = backlink_candidates
+        description = primary.get("description", "")
+        comments    = primary.get("comments", [])
+        title       = primary.get("title", "")
+        component   = primary.get("component", "")
 
+        # Derive search keywords from title + component
+        _stop = {
+            "add", "fix", "update", "remove", "missing",
+            "error", "failed", "cannot", "unable", "invalid",
+            "exception", "issue", "problem", "wrong", "broken",
+            "with", "from", "into", "this", "that", "using",
+        }
+        keywords = list(dict.fromkeys(
+            w.strip(".,()[]").lower()
+            for w in f"{title} {component}".split()
+            if len(w.strip(".,()[]")) > 3
+            and w.lower().strip(".,()[]") not in _stop
+        ))[:8]
+
+        # LEVEL 1: Backlink extraction
+        backlinks  = self._extract_backlinks(description, comments)
+        candidates = []
+        for jira_id in backlinks["jira"]:
+            candidates.append({
+                "id":            jira_id,
+                "source":        "jira",
+                "from_backlink": True,
+                "title":         jira_id,
+                "description":   "",
+                "overlap_score": 999,
+            })
+        for gh_id in backlinks["github"]:
+            candidates.append({
+                "id":            f"#{gh_id}",
+                "source":        "github",
+                "from_backlink": True,
+                "title":         f"GitHub #{gh_id}",
+                "description":   "",
+                "overlap_score": 999,
+            })
+        for bz_id in backlinks["bugzilla"]:
+            candidates.append({
+                "id":            f"BZ-{bz_id}",
+                "source":        "bugzilla",
+                "from_backlink": True,
+                "title":         f"BZ-{bz_id}",
+                "description":   "",
+                "overlap_score": 999,
+            })
+        log.info("CrossSystem backlinks found",
+                 jira=len(backlinks["jira"]),
+                 github=len(backlinks["github"]),
+                 bugzilla=len(backlinks["bugzilla"]))
+        context["backlink_candidates"] = backlinks
+
+        # LEVEL 2: Redis cache scan + Groq scoring
+        cache_candidates = await self._scan_redis_cache(keywords)
+        if cache_candidates:
+            source_ticket = {
+                "title":       title,
+                "description": description,
+            }
+            scored = await self._batch_score_with_groq(
+                source_ticket, cache_candidates)
+            candidates.extend(scored)
+
+        # LEVEL 3: Live API search — only if < 2 unique candidates
+        total_unique = len({c["id"] for c in candidates})
+        if total_unique < 2:
+            log.warning(
+                "Levels 1+2 returned fewer than 2 candidates. "
+                "Falling back to live API search.")
+            live_results, sources_queried = await self._live_api_search(
+                primary, primary_source, context)
+            candidates.extend(live_results)
+            context["related_tickets"]  = live_results
+            context["sources_queried"]  = sources_queried
+        else:
+            context["related_tickets"]  = candidates
+            context["sources_queried"]  = []
+
+        context["related_candidates"] = candidates
+        return context
+
+    # ── Redis cache scan (Level 2) ────────────────────────────────
+    async def _scan_redis_cache(self,
+                                 keywords: list[str]) -> list[dict]:
+        try:
+            from ..redis_client import get_redis
+            r    = await get_redis()
+            keys = await r.keys("buglist:*")
+            hits = []
+            for key in keys:
+                try:
+                    val = await r.get(key)
+                    if not val:
+                        continue
+                    bug_list = json.loads(val)
+                    if not isinstance(bug_list, list):
+                        continue
+                    for bug in bug_list:
+                        text    = (
+                            (bug.get("title") or "") + " " +
+                            (bug.get("description") or "")
+                        ).lower()
+                        overlap = sum(
+                            1 for kw in keywords if kw in text)
+                        if overlap >= 1:
+                            hits.append({
+                                "id":           (
+                                    bug.get("ticket_id") or
+                                    bug.get("id") or ""),
+                                "title":        bug.get("title") or "",
+                                "description":  (
+                                    bug.get("description") or "")[:300],
+                                "source":       (
+                                    bug.get("system_type") or
+                                    bug.get("source_id") or "unknown"),
+                                "overlap_score": overlap,
+                            })
+                except Exception:
+                    continue
+            hits.sort(
+                key=lambda x: x["overlap_score"], reverse=True)
+            log.info("CrossSystem redis scan",
+                     keys=len(keys), hits=len(hits))
+            return hits[:20]
+        except Exception as e:
+            log.warning("CrossSystem redis scan failed",
+                        error=str(e))
+            return []
+
+    # ── Groq batch scoring for cache candidates (Level 2) ────────
+    async def _batch_score_with_groq(
+            self,
+            source_ticket: dict,
+            candidates: list[dict]) -> list[dict]:
+        groq_api_key = os.getenv("GROQ_API_KEY", "")
+        if not groq_api_key:
+            for c in candidates:
+                c["relevance_score"] = 5.0
+            return sorted(
+                candidates,
+                key=lambda x: x.get("overlap_score", 0),
+                reverse=True)[:10]
+
+        cands_text = ""
+        for i, c in enumerate(candidates):
+            cands_text += (
+                f"\n[{i}] ID: {c['id']}\n"
+                f"Title: {c['title']}\n"
+                f"Desc: {c['description'][:150]}\n"
+            )
+
+        prompt = (
+            f"Score how relevant each candidate bug is to the "
+            f"source bug.\n\n"
+            f"Source bug:\n"
+            f"Title: {source_ticket.get('title', '')}\n"
+            f"Description: "
+            f"{(source_ticket.get('description') or '')[:400]}\n\n"
+            f"Candidate bugs:{cands_text}\n\n"
+            f"Return ONLY a JSON array. Each element must have:\n"
+            f'  {{"id": "...", "relevance_score": 0-10, '
+            f'"reason": "one sentence"}}\n'
+            f"No preamble, no explanation. JSON array only."
+        )
+
+        try:
+            client = AsyncGroq(api_key=groq_api_key)
+            resp   = await client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=800,
+            )
+            raw = (resp.choices[0].message.content or "[]")
+            raw = raw.strip().strip("```json").strip(
+                "```").strip()
+            parsed = json.loads(raw)
+
+            score_map = {}
+            for item in (parsed
+                         if isinstance(parsed, list) else []):
+                try:
+                    score_map[str(item["id"])] = {
+                        "relevance_score": float(
+                            item.get("relevance_score", 5)),
+                        "reason": str(item.get("reason", "")),
+                    }
+                except Exception:
+                    continue
+
+            for c in candidates:
+                sid = str(c["id"])
+                if sid in score_map:
+                    c["relevance_score"] = (
+                        score_map[sid]["relevance_score"])
+                    c["reason"] = score_map[sid]["reason"]
+                else:
+                    c["relevance_score"] = 5.0
+
+            candidates.sort(
+                key=lambda x: x.get("relevance_score", 0),
+                reverse=True)
+            return candidates[:10]
+
+        except Exception as e:
+            log.warning("CrossSystem Groq cache scoring failed",
+                        error=str(e))
+            for c in candidates:
+                c["relevance_score"] = float(
+                    c.get("overlap_score", 5))
+            candidates.sort(
+                key=lambda x: x.get("relevance_score", 0),
+                reverse=True)
+            return candidates[:10]
+
+    # ── Live API search (Level 3 fallback) ───────────────────────
+    async def _live_api_search(
+            self,
+            primary: dict,
+            primary_source: str,
+            context: dict) -> tuple[list, list]:
         groq_api_key = os.getenv("GROQ_API_KEY", "")
         groq_model   = os.getenv(
             "GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -60,9 +276,7 @@ class CrossSystemFetchAgent(BaseAgent):
 
         if not targets:
             log.warning("CrossSystem: no targets found")
-            context["related_tickets"] = []
-            context["sources_queried"] = []
-            return context
+            return [], []
 
         # Step C: Parallel search with platform-specific queries
         async def search_one(connector):
@@ -111,28 +325,31 @@ class CrossSystemFetchAgent(BaseAgent):
         gathered = await asyncio.gather(
             *[search_one(c) for c in targets])
 
-        candidates    = []
+        live_candidates = []
         sources_queried = []
         for source_id, tickets in gathered:
             sources_queried.append(source_id)
             for t in tickets:
-                candidates.append(dataclasses.asdict(t))
+                d = dataclasses.asdict(t)
+                d["id"] = d.get("ticket_id", "")
+                live_candidates.append(d)
 
         log.info("CrossSystem candidates",
-                 total=len(candidates))
+                 total=len(live_candidates))
 
         # Step D: Add co-references as direct hits (score=1.0)
         direct_hits = await self._fetch_co_references(
             context, all_connectors, primary_source)
+        for d in direct_hits:
+            d["id"] = d.get("ticket_id", "")
 
         # Tier 2: if 0 results, try single-word fallback
-        if not candidates and not direct_hits:
+        if not live_candidates and not direct_hits:
             primary_title = (primary.get("title") or "")
             fallback_map  = self._deterministic_fallback(
                 primary_title,
                 primary.get("component") or "")
-            fallback_term = fallback_map.get(
-                "jira_query", "")
+            fallback_term = fallback_map.get("jira_query", "")
 
             if (fallback_term
                     and fallback_term != query_map.get(
@@ -141,16 +358,10 @@ class CrossSystemFetchAgent(BaseAgent):
                          term=fallback_term)
 
                 async def search_fallback(connector):
-                    ctype = type(connector).__name__.lower()
-                    if "jira" in ctype:
-                        q = fallback_term
-                    elif "github" in ctype:
-                        q = fallback_term
-                    else:
-                        q = fallback_term
                     try:
                         r = await asyncio.wait_for(
-                            connector.search(q, max_results=8),
+                            connector.search(
+                                fallback_term, max_results=8),
                             timeout=15.0)
                         return connector.source_id, r
                     except Exception:
@@ -164,27 +375,29 @@ class CrossSystemFetchAgent(BaseAgent):
                         continue
                     sid, tickets = result
                     for t in tickets:
-                        candidates.append(dataclasses.asdict(t))
+                        d = dataclasses.asdict(t)
+                        d["id"] = d.get("ticket_id", "")
+                        live_candidates.append(d)
 
         log.info("CrossSystem candidates after fallback",
-                 total=len(candidates))
+                 total=len(live_candidates))
 
         # Step E: Batch score all candidates in ONE LLM call
         scored = await self._batch_score(
-            primary, candidates, groq_api_key, groq_model)
+            primary, live_candidates, groq_api_key, groq_model)
+        for d in scored:
+            d["id"] = d.get("ticket_id", "")
 
         # Merge direct hits first then scored
         seen_ids = set()
         final    = []
         for item in direct_hits + scored:
-            tid = item.get("ticket_id", "")
+            tid = item.get("ticket_id", "") or item.get("id", "")
             if tid not in seen_ids:
                 seen_ids.add(tid)
                 final.append(item)
 
-        context["related_tickets"]  = final
-        context["sources_queried"]  = sources_queried
-        return context
+        return final, sources_queried
 
     # ── Query generation ──────────────────────────────────────────
     async def _generate_platform_queries(
