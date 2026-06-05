@@ -22,6 +22,31 @@ function SrcBadge({ type }) {
   return <span className={`sb ${cls}`}>{lbl}</span>
 }
 
+const toPercent = (score) => {
+  if (score == null) return 0
+  if (score > 1) return Math.min(Math.round(score), 100)
+  return Math.min(Math.round(score * 100), 100)
+}
+
+function TicketLink({ ticket }) {
+  const isValidUrl = ticket.url && ticket.url.startsWith('https://')
+  const ticketId   = ticket.id || ticket.ticket_id
+  if (isValidUrl) {
+    return (
+      <a
+        href={ticket.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{ color: 'inherit', textDecoration: 'underline', cursor: 'pointer' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {ticketId}
+      </a>
+    )
+  }
+  return <span>{ticketId}</span>
+}
+
 export default function ResultsPage() {
   const { caseId }  = useParams()
   const navigate    = useNavigate()
@@ -57,7 +82,7 @@ export default function ResultsPage() {
   const ctx        = result.context || {}
   const synthesis  = ctx.synthesis  || {}
   const ticket     = ctx.primary_ticket || {}
-  const conf       = (synthesis.confidence || 0) * 100
+  const conf       = toPercent(synthesis.confidence)
   const sevBlockCls = { P0: 'p0-b', P1: 'p1-b', P2: 'p2-b', P3: 'p3-b' }[synthesis.unified_severity] || 'p3-b'
   const caseShort  = `BT-${caseId.slice(-5).toUpperCase()}`
   const srcType    = ticket.system_type || ticket.source
@@ -111,23 +136,33 @@ export default function ResultsPage() {
             {!ctx.related_tickets?.length ? (
               <p style={{ color: 'var(--text3)', fontSize: 13 }}>No related issues found.</p>
             ) : ctx.related_tickets.map((t, i) => {
-              const score  = t.similarity_score || 0
-              const pct    = (score * 100).toFixed(0)
-              const simCls = score >= 0.8 ? 'h' : score >= 0.6 ? 'm' : 'l'
-              const fillCls= score >= 0.8 ? 'sim-h' : score >= 0.6 ? 'sim-m' : 'sim-l'
+              const score    = t.similarity_score || t.relevance_score || 0
+              const pct      = toPercent(score)
+              const simCls   = score >= 0.8 ? 'h' : score >= 0.6 ? 'm' : 'l'
+              const fillCls  = score >= 0.8 ? 'sim-h' : score >= 0.6 ? 'sim-m' : 'sim-l'
+              const barColor = score >= 0.8 ? 'var(--teal)' : 'var(--orange)'
+              const hasUrl   = t.url && t.url.startsWith('https://')
               return (
                 <div key={i} className="issue-card">
                   <div className="issue-top">
-                    <span className="mono" style={{ fontSize: 11, color: 'var(--text2)' }}>{t.ticket_id}</span>
+                    <span className="mono" style={{ fontSize: 11, color: hasUrl ? 'var(--blue)' : 'var(--text2)', flexShrink: 0 }}>
+                      <TicketLink ticket={t} />
+                    </span>
                     <span className="issue-name">{t.title?.slice(0, 60)}</span>
                     {t.severity && <SevBadge sev={t.severity} />}
+                    {hasUrl && (
+                      <a href={t.url} target="_blank" rel="noopener noreferrer" className="ext-btn" onClick={(e) => e.stopPropagation()}>↗</a>
+                    )}
                   </div>
                   <div className="sim-row">
                     <div className="sim-bar">
-                      <div className={`sim-fill ${fillCls}`} style={{ width: `${pct}%` }} />
+                      <div className={`sim-fill ${fillCls}`} style={{ width: `${pct}%`, background: barColor }} />
                     </div>
                     <span className={`sim-pct ${simCls}`}>{pct}%</span>
                   </div>
+                  {t.similarity_reason && (
+                    <p className="sim-reason">{t.similarity_reason}</p>
+                  )}
                 </div>
               )
             })}

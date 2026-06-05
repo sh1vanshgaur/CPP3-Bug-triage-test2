@@ -46,7 +46,8 @@ export default function DashboardPage() {
   const total      = metrics?.sources_total ?? 0
   const triaged    = metrics?.total_triages ?? metrics?.total_triaged ?? 0
   const recentAct  = metrics?.recent_activity || []
-  const avgConf    = metrics?.avg_confidence != null ? Math.round(metrics.avg_confidence * 100) : null
+  const toPercent  = (s) => s == null ? 0 : s > 1 ? Math.min(Math.round(s), 100) : Math.min(Math.round(s * 100), 100)
+  const avgConf    = metrics?.avg_confidence != null ? toPercent(metrics.avg_confidence) : null
 
   const liveP2 = Math.max(0, liveTotal - liveP0 - liveP1)
 
@@ -162,7 +163,7 @@ export default function DashboardPage() {
               </thead>
               <tbody>
                 {recentAct.map((entry, i) => {
-                  const conf = entry.confidence ? `${(entry.confidence * 100).toFixed(0)}%` : '—'
+                  const conf = entry.confidence != null ? `${toPercent(entry.confidence)}%` : '—'
                   const dur  = entry.duration_ms ? `${(entry.duration_ms / 1000).toFixed(1)}s` : '—'
                   return (
                     <tr key={entry.case_id || i} style={{ borderBottom: '1px solid var(--border)' }}>

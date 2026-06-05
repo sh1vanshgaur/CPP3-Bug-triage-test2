@@ -125,8 +125,16 @@ async def purge_buglist_cache() -> int:
     try:
         r = await get_redis()
         keys = []
-        async for key in r.scan_iter("buglist:*"):
-            keys.append(key)
+        for pattern in (
+            "buglist:*",
+            "bug_list:*",
+            "bug:data:*",
+            "buglist:all:scores",
+            "buglist:last_refreshed",
+        ):
+            async for key in r.scan_iter(pattern):
+                keys.append(key)
+        keys = list(dict.fromkeys(keys))
         if keys:
             await r.delete(*keys)
         return len(keys)

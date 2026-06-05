@@ -33,24 +33,21 @@ class GithubConnector(BaseConnector):
     def _repo(self) -> str:
         return self.project_key
 
-    def _normalise(self, raw: dict) -> TicketData:
-        labels = [lbl.get("name", "") for lbl in raw.get("labels", [])]
-
-        severity = "Unknown"
+    def _extract_priority_from_labels(self, labels: list) -> str:
         for lbl in labels:
             lbl_lower = lbl.lower()
             if lbl_lower in SEVERITY_LABEL_MAP:
-                severity = SEVERITY_LABEL_MAP[lbl_lower]
-                break
-        if severity == "Unknown":
-            for lbl in labels:
-                lbl_lower = lbl.lower()
-                for key, val in SEVERITY_LABEL_MAP.items():
-                    if key in lbl_lower:
-                        severity = val
-                        break
-                if severity != "Unknown":
-                    break
+                return SEVERITY_LABEL_MAP[lbl_lower]
+        for lbl in labels:
+            lbl_lower = lbl.lower()
+            for key, val in SEVERITY_LABEL_MAP.items():
+                if key in lbl_lower:
+                    return val
+        return "Unknown"
+
+    def _normalise(self, raw: dict) -> TicketData:
+        labels = [lbl.get("name", "") for lbl in raw.get("labels", [])]
+        severity = self._extract_priority_from_labels(labels)
 
         component = ""
         for lbl in labels:
@@ -76,6 +73,7 @@ class GithubConnector(BaseConnector):
             source_id=self.source_id,
             system_type=self.system_type,
             url=raw.get("html_url", ""),
+            api_url=raw.get("url", ""),
             labels=labels,
             linked_items=linked_items,
         )

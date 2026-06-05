@@ -659,6 +659,11 @@ input, select, textarea { font-family: inherit; }
 .modal-actions { display: flex; gap: 9px; margin-top: 18px; }
 
 
+/* ===== SPINNER ===== */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 /* ===== SKELETON LOADER ===== */
 @keyframes skeleton-shimmer {
   0%   { background-position: -400px 0; }

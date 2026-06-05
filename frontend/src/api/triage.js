@@ -1,7 +1,7 @@
 import client from './client'
 
-export const startTriage = (bugId, sourceId = "") =>
-  client.post('/triage', { bug_id: bugId, source_id: sourceId }).then(r => r.data)
+export const startTriage = (bugId, sourceId = "", forceRefresh = false) =>
+  client.post('/triage', { bug_id: bugId, source_id: sourceId, force_refresh: forceRefresh }).then(r => r.data)
 
 export const openTriageStream = (caseId, onPanel, onComplete, onError) => {
   const token = localStorage.getItem('hpe_token') || ''

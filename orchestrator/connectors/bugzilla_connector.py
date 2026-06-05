@@ -60,6 +60,7 @@ class BugzillaConnector(BaseConnector):
             source_id=self.source_id,
             system_type=self.system_type,
             url=f"{self.base_url}/show_bug.cgi?id={raw.get('id', '')}",
+            api_url=f"{self.base_url}/rest/bug/{raw.get('id', '')}",
             linked_items=linked_items,
         )
 

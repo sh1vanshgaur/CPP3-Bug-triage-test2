@@ -81,7 +81,8 @@ export default function HistoryPage() {
             </thead>
             <tbody>
               {history.map((entry) => {
-                const confVal = entry.confidence != null ? entry.confidence * 100 : null
+                const toPercent = (s) => s == null ? 0 : s > 1 ? Math.min(Math.round(s), 100) : Math.min(Math.round(s * 100), 100)
+                const confVal = entry.confidence != null ? toPercent(entry.confidence) : null
                 const rootCause = (entry.root_cause || '').slice(0, 80) + ((entry.root_cause || '').length > 80 ? '…' : '')
                 return (
                   <tr key={entry.id} className="hist-tr">
@@ -103,7 +104,7 @@ export default function HistoryPage() {
                     </td>
                     <td className="hist-td">
                       {confVal != null
-                        ? <span style={{ fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', fontSize: 12, color: confColor(entry.confidence) }}>{confVal.toFixed(0)}%</span>
+                        ? <span style={{ fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', fontSize: 12, color: confColor(entry.confidence) }}>{confVal}%</span>
                         : <span style={{ color: 'var(--text3)' }}>—</span>
                       }
                     </td>

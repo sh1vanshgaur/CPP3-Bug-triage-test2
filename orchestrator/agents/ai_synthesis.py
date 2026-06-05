@@ -44,6 +44,31 @@ class AISynthesisAgent(BaseAgent):
             context["synthesis"] = self._keyword_fallback(primary).model_dump()
             return context
 
+        # BUG2-B: cache check — same bug always returns same triage within 1 hour
+        bug_id_ctx    = context.get("bug_id", "")
+        source_id_ctx = context.get("source_id", "")
+        force_refresh = context.get("force_refresh", False)
+        _cache_key    = f"triage_result:{source_id_ctx}:{bug_id_ctx}"
+        if not force_refresh and bug_id_ctx:
+            try:
+                from ..redis_client import get_redis
+                _r = await get_redis()
+                _cached = await _r.get(_cache_key)
+                if _cached:
+                    log.info("AISynthesis: cache hit", bug_id=bug_id_ctx)
+                    context["synthesis"] = json.loads(_cached)
+                    try:
+                        _s = SynthesisOutput(**context["synthesis"])
+                        _gid = await self._resolve_group_id(context, _s)
+                        if _gid:
+                            context["group_id"] = _gid
+                            context["synthesis"]["group_id"] = _gid
+                    except Exception:
+                        pass
+                    return context
+            except Exception as e:
+                log.warning("AISynthesis: cache check failed", error=str(e))
+
         prompt = self._build_prompt(primary, related, kb_articles, customer_cases)
         client = AsyncGroq(api_key=groq_api_key)
 
@@ -55,13 +80,31 @@ class AISynthesisAgent(BaseAgent):
                     extra = f"\n\nIMPORTANT: Respond ONLY with valid JSON matching this schema:\n{SYNTHESIS_SCHEMA}"
                 resp = await client.chat.completions.create(
                     model=groq_model,
-                    messages=[{"role": "user", "content": prompt + extra}],
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Always respond with a single definitive answer. "
+                                "Do not hedge or say 'insufficient information'. "
+                                "If data is limited, make your best determination "
+                                "and state your confidence level numerically."
+                            ),
+                        },
+                        {"role": "user", "content": prompt + extra},
+                    ],
                     temperature=0.0,
+                    seed=42,
                     response_format={"type": "json_object"},
                     max_tokens=1024,
                 )
                 raw = resp.choices[0].message.content or "{}"
                 data = json.loads(raw)
+                # BUG1: normalize confidence before Pydantic validates ge=0 le=1
+                raw_conf = data.get("confidence")
+                if isinstance(raw_conf, (int, float)):
+                    if raw_conf > 1.0:
+                        data["confidence"] = round(float(raw_conf) / 10.0, 2)
+                    data["confidence"] = max(0.0, min(1.0, float(data["confidence"])))
                 synthesis = SynthesisOutput(**data)
                 break
             except (ValidationError, json.JSONDecodeError, Exception) as e:
@@ -81,11 +124,17 @@ class AISynthesisAgent(BaseAgent):
                     model="llama-3.1-8b-instant",
                     messages=[{"role": "user", "content": repair_prompt}],
                     temperature=0.0,
+                    seed=42,
                     response_format={"type": "json_object"},
                     max_tokens=512,
                 )
                 raw = repair_resp.choices[0].message.content or "{}"
                 data = json.loads(raw)
+                raw_conf = data.get("confidence")
+                if isinstance(raw_conf, (int, float)):
+                    if raw_conf > 1.0:
+                        data["confidence"] = round(float(raw_conf) / 10.0, 2)
+                    data["confidence"] = max(0.0, min(1.0, float(data["confidence"])))
                 synthesis = SynthesisOutput(**data)
                 log.info("Synthesis repaired with fast model")
             except Exception as e:
@@ -95,6 +144,16 @@ class AISynthesisAgent(BaseAgent):
             synthesis = self._keyword_fallback(primary)
 
         context["synthesis"] = synthesis.model_dump()
+
+        # BUG2-B: persist synthesis result so re-triage within 1 h returns same scores
+        if bug_id_ctx:
+            try:
+                from ..redis_client import get_redis
+                _r = await get_redis()
+                await _r.setex(_cache_key, 3600,
+                               json.dumps(context["synthesis"]))
+            except Exception:
+                pass
 
         # BT-xxx System ID Resolution Block
         group_id = await self._resolve_group_id(
@@ -112,7 +171,9 @@ class AISynthesisAgent(BaseAgent):
                       kb_articles: list, customer_cases: list = None) -> str:
         related_str = ""
         for r in related[:5]:
-            related_str += f"- [{r.get('source_id','')}] {r.get('ticket_id','')} — {r.get('title','')} (score: {r.get('similarity_score', 0):.2f}, reason: {r.get('similarity_reason','')})\n"
+            src = r.get('source') or r.get('source_id') or r.get('system_type') or ''
+            tid = r.get('id') or r.get('ticket_id') or ''
+            related_str += f"- [{src}] {tid} — {r.get('title','')} (score: {r.get('similarity_score', 0):.2f}, reason: {r.get('similarity_reason','')})\n"
 
         kb_str = ""
         for kb in kb_articles[:3]:
@@ -172,9 +233,9 @@ Guidelines:
 
         all_tickets = [primary_ticket_ref] + [
             {
-                "ticket_id": t.get("ticket_id", ""),
-                "source_id": t.get("source_id", ""),
-                "system_type": t.get("system_type", ""),
+                "ticket_id":  t.get("ticket_id") or t.get("id") or "",
+                "source_id":  t.get("source_id") or t.get("source") or "",
+                "system_type": t.get("system_type") or t.get("source") or "",
             }
             for t in related
             if t.get("similarity_score", 0) >= 0.50

@@ -106,6 +106,7 @@ class JiraConnector(BaseConnector):
             source_id=self.source_id,
             system_type=self.system_type,
             url=f"{self.base_url}/browse/{raw.get('key', '')}",
+            api_url=f"{self.base_url}/rest/api/2/issue/{raw.get('key', '')}",
             comments=comments,
             linked_items=linked_items,
         )

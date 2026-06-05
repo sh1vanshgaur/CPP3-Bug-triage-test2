@@ -86,8 +86,8 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     log.warning(f"[Ingestion] Cycle error: {e}")
 
-                # Run every 60 seconds to keep 120s TTL cache warm
-                await asyncio.sleep(60)
+                # Run every 4 minutes to keep 300s TTL cache warm
+                await asyncio.sleep(240)
 
         ingestion_task = asyncio.create_task(background_ingestion())
         app.state.ingestion_task = ingestion_task

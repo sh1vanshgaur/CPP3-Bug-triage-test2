@@ -20,7 +20,8 @@ router = APIRouter(tags=["triage"])
 
 class TriageRequest(BaseModel):
     bug_id: str
-    source_id: str = ""  # Optional — if provided, skips server-side detection
+    source_id: str = ""        # Optional — if provided, skips server-side detection
+    force_refresh: bool = False  # If True, bypass LLM result cache
 
 
 @router.post("/triage")
@@ -34,6 +35,9 @@ async def start_triage(
         raise HTTPException(status_code=400, detail="bug_id is required")
 
     source_id = body.source_id.strip() if body.source_id else ""
+    log.info("Triage request received",
+             ticket_id=bug_id,
+             source_id=source_id)
 
     async with AsyncSessionLocal() as db:
         sources = await get_enabled_sources(db)
@@ -64,7 +68,10 @@ async def start_triage(
     if not source_id:
         raise HTTPException(status_code=400, detail="No source system configured")
 
-    log.info("Starting triage", bug_id=bug_id, source_id=source_id, user=user.user_id)
+    log.info("Starting triage",
+             ticket_id=bug_id,
+             source_id=source_id,
+             user=user.user_id)
 
     case_id = str(uuid4())
     producer = getattr(request.app.state, "kafka_producer", None)
@@ -79,7 +86,8 @@ async def start_triage(
         orch = TaskOrchestrator()
         asyncio.create_task(
             orch.run(case_id, bug_id, source_id,
-                     user.user_id))
+                     user.user_id,
+                     force_refresh=body.force_refresh))
     else:
         published = False
         if producer:
@@ -94,7 +102,8 @@ async def start_triage(
             orch = TaskOrchestrator()
             asyncio.create_task(
                 orch.run(case_id, bug_id, source_id,
-                         user.user_id))
+                         user.user_id,
+                         force_refresh=body.force_refresh))
 
     return {"case_id": case_id, "bug_id": bug_id, "source_id": source_id, "status": "accepted"}
 
