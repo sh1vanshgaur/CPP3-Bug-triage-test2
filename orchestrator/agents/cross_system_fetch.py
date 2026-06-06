@@ -164,6 +164,10 @@ class CrossSystemFetchAgent(BaseAgent):
             reverse=True)
 
         context["related_tickets"]    = normalized
+        context["related_issues"]     = {
+            "related_tickets": normalized,
+            "sources_queried": sources_queried,
+        }
         context["sources_queried"]    = sources_queried
         context["related_candidates"] = normalized
         return context

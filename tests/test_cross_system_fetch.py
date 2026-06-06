@@ -73,6 +73,7 @@ def test_cross_system_excludes_primary_ticket(monkeypatch):
     ids = [item["ticket_id"] for item in context["related_tickets"]]
     assert "STO-1089" not in ids
     assert ids == ["REL-1"]
+    assert context["related_issues"]["related_tickets"] == context["related_tickets"]
 
 
 def test_cross_system_deduplicates_repeated_related_tickets(monkeypatch):

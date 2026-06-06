@@ -166,17 +166,19 @@ class TaskOrchestrator:
                          context_keys=self._context_keys(context))
 
             context["related_issues"] = {
-                "related_tickets": context.get("related_tickets") or [],
+                "related_tickets": self._related_tickets_from_context(context),
                 "sources_queried": context.get("sources_queried") or [],
             }
+            context["related_tickets"] = self._related_tickets_from_context(context)
             context["knowledge_base"] = {
                 "kb_articles": context.get("kb_articles") or [],
                 "kb_reasoning": context.get("kb_reasoning") or "",
             }
+            context["kb_articles"] = context.get("kb_articles") or []
 
             await self._checkpoint(case_id, "enrichment", context)
             await self._publish_panel(case_id, "related_issues", {
-                "related_tickets": context.get("related_tickets") or [],
+                "related_tickets": self._related_tickets_from_context(context),
                 "sources_queried": context.get("sources_queried") or [],
             }, agent="CrossSystemFetchAgent", status="completed")
             await self._publish_panel(case_id, "linked_context", {
@@ -206,18 +208,20 @@ class TaskOrchestrator:
                 context["group_id"] = group_id
 
         if "ai_synthesis" in steps_to_run:
+            self._normalize_ai_inputs(context)
             missing = self._missing_ai_requirements(context)
             if missing:
-                self._add_pipeline_error(
-                    context,
+                message = (
                     "AISynthesisAgent skipped; missing upstream context: "
-                    + ", ".join(missing),
+                    + ", ".join(missing)
                 )
+                self._add_pipeline_error(context, message)
                 log.warning("Pipeline agent skipped",
                             case_id=case_id,
                             agent="AISynthesisAgent",
                             missing=missing,
                             context_keys=self._context_keys(context))
+                await self._publish_ai_summary_failed(case_id, context)
             else:
                 log.info("Pipeline agent start",
                          case_id=case_id,
@@ -344,6 +348,12 @@ class TaskOrchestrator:
         except Exception as e:
             log.warning("publish_complete failed", error=str(e))
 
+    async def _publish_ai_summary_failed(self, case_id: str, context: dict) -> None:
+        await self._publish_panel(case_id, "ai_summary", {
+            "synthesis": context.get("synthesis") or {},
+            "errors": context.get("errors") or {},
+        }, agent="AISynthesisAgent", status="failed")
+
     def _has_primary_ticket(self, context: dict) -> bool:
         primary = context.get("primary_ticket")
         return bool(
@@ -353,14 +363,56 @@ class TaskOrchestrator:
         )
 
     def _missing_ai_requirements(self, context: dict) -> list[str]:
+        self._normalize_ai_inputs(context)
         missing = []
         if not self._has_primary_ticket(context):
             missing.append("primary_ticket")
-        if "related_tickets" not in context:
+        if ("related_tickets" not in context
+                and "related_issues" not in context):
             missing.append("related_tickets")
-        if "kb_articles" not in context:
+        if ("kb_articles" not in context
+                and "knowledge_base" not in context):
             missing.append("kb_articles")
         return missing
+
+    def _normalize_ai_inputs(self, context: dict) -> None:
+        if "related_tickets" not in context and "related_issues" in context:
+            context["related_tickets"] = self._related_tickets_from_context(context)
+        elif "related_tickets" in context:
+            context["related_tickets"] = context.get("related_tickets") or []
+
+        if "related_issues" not in context:
+            context["related_issues"] = {
+                "related_tickets": context.get("related_tickets") or [],
+                "sources_queried": context.get("sources_queried") or [],
+            }
+
+        if "kb_articles" not in context and "knowledge_base" in context:
+            kb = context.get("knowledge_base") or {}
+            if isinstance(kb, dict):
+                context["kb_articles"] = kb.get("kb_articles") or []
+            else:
+                context["kb_articles"] = []
+        elif "kb_articles" in context:
+            context["kb_articles"] = context.get("kb_articles") or []
+
+        if "knowledge_base" not in context:
+            context["knowledge_base"] = {
+                "kb_articles": context.get("kb_articles") or [],
+                "kb_reasoning": context.get("kb_reasoning") or "",
+            }
+
+    def _related_tickets_from_context(self, context: dict) -> list:
+        related = context.get("related_tickets")
+        if isinstance(related, list):
+            return related
+        related_issues = context.get("related_issues")
+        if isinstance(related_issues, dict):
+            nested = related_issues.get("related_tickets")
+            return nested if isinstance(nested, list) else []
+        if isinstance(related_issues, list):
+            return related_issues
+        return []
 
     def _add_pipeline_error(self, context: dict, message: str) -> None:
         context.setdefault("errors", {})
