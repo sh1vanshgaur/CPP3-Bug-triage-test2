@@ -1,0 +1,125 @@
+{
+  "_instructions": "Upload these bugs to their respective platforms. Each group contains bugs that SHOULD be detected as related by the cross-system fetch agent. Bugs within each group share root causes, error types, and component names.",
+
+  "group_1_spark_sql_optimizer_crash": {
+    "description": "All 4 bugs relate to Spark SQL optimizer crashes when handling CTEs (Common Table Expressions). Same root cause: NormalizeCTEIds fails on recursive CTE references.",
+
+    "jira_bug": {
+      "platform": "Apache JIRA (issues.apache.org/jira)",
+      "project": "SPARK",
+      "summary": "NormalizeCTEIds throws AnalysisException on recursive CTE with window functions",
+      "description": "When running a recursive CTE query that includes window functions (ROW_NUMBER, RANK), the optimizer's NormalizeCTEIds rule throws an AnalysisException.\n\nReproduction:\n```sql\nWITH RECURSIVE cte AS (\n  SELECT id, name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) as rn\n  FROM employees\n  WHERE manager_id IS NULL\n  UNION ALL\n  SELECT e.id, e.name, ROW_NUMBER() OVER (PARTITION BY e.dept ORDER BY e.salary DESC) as rn\n  FROM employees e\n  JOIN cte ON e.manager_id = cte.id\n)\nSELECT * FROM cte WHERE rn <= 3\n```\n\nStack trace:\n```\norg.apache.spark.sql.AnalysisException: Recursive CTE 'cte' is not supported with window functions\n  at org.apache.spark.sql.catalyst.analysis.NormalizeCTEIds.apply(NormalizeCTEIds.scala:78)\n  at org.apache.spark.sql.catalyst.rules.RuleExecutor.execute(RuleExecutor.scala:116)\n  at org.apache.spark.sql.catalyst.analysis.Analyzer.executeSameContext(Analyzer.scala:226)\n```\n\nExpected: Should handle recursive CTEs with window functions.\nAffected versions: 3.5.x, 4.0.0-preview",
+      "priority": "Critical",
+      "component": "SQL",
+      "labels": ["CTE", "optimizer", "regression"],
+      "affects_version": "3.5.1"
+    },
+
+    "github_bug": {
+      "platform": "GitHub (apache/spark)",
+      "title": "Spark SQL CTE optimizer crash with InlineCTE and nested subqueries",
+      "body": "## Bug Report\n\n**Describe the bug:**\nSpark SQL throws `StackOverflowError` when `InlineCTE` rule processes a CTE that is referenced in a nested subquery within another CTE.\n\n**To Reproduce:**\n```sql\nWITH \n  cte1 AS (SELECT id, SUM(amount) as total FROM orders GROUP BY id),\n  cte2 AS (\n    SELECT * FROM cte1 WHERE total > (\n      SELECT AVG(total) FROM cte1\n    )\n  )\nSELECT * FROM cte2\n```\n\n**Stack trace:**\n```\njava.lang.StackOverflowError\n  at org.apache.spark.sql.catalyst.optimizer.InlineCTE$.apply(InlineCTE.scala:45)\n  at org.apache.spark.sql.catalyst.optimizer.InlineCTE$.apply(InlineCTE.scala:45)\n  at org.apache.spark.sql.catalyst.optimizer.InlineCTE$.apply(InlineCTE.scala:45)\n  ... (recursive)\n```\n\n**Expected behavior:** CTE with nested self-references should be inlined correctly without stack overflow.\n\n**Environment:**\n- Spark 3.5.1\n- Java 17\n- Scala 2.13\n\nRelated: SPARK-45892, SPARK-44721\nSee also: https://issues.apache.org/jira/browse/SPARK-45892",
+      "labels": ["bug", "SQL"],
+      "assignee": null
+    },
+
+    "bugzilla_bug": {
+      "platform": "Mozilla Bugzilla (or any Bugzilla instance you control)",
+      "product": "TestProject",
+      "component": "SQL Engine",
+      "summary": "CTE query optimizer NormalizeCTEIds infinite loop on self-referencing expressions",
+      "description": "The CTE optimizer gets stuck in an infinite loop when a CTE expression references itself through a LATERAL JOIN.\n\nSteps to Reproduce:\n1. Create a CTE with a LATERAL JOIN that references the CTE alias\n2. Execute the query\n3. Query hangs indefinitely, consuming 100% CPU\n\nExpected: Query should either execute or return a clear error\nActual: Infinite loop in NormalizeCTEIds rule\n\nStack sample (thread dump):\n```\n\"main\" #1 prio=5 os_prio=0\n   at optimizer.NormalizeCTEIds.resolveCTERelation(NormalizeCTEIds.java:142)\n   at optimizer.NormalizeCTEIds.resolveCTERelation(NormalizeCTEIds.java:145)\n   at optimizer.NormalizeCTEIds.resolveCTERelation(NormalizeCTEIds.java:145)\n```\n\nRelated issues: SPARK-45892",
+      "priority": "P1",
+      "severity": "critical",
+      "see_also": ["https://issues.apache.org/jira/browse/SPARK-45892"]
+    },
+
+    "github_bug_2": {
+      "platform": "GitHub (apache/spark)",
+      "title": "AnalysisException when CTERelationDef references are not properly resolved during optimization",
+      "body": "## Bug\n\nDuring query optimization, `CTERelationDef` nodes that reference other CTE definitions fail to resolve properly when the execution order creates a circular dependency.\n\n```\norg.apache.spark.sql.AnalysisException: CTE relation 'cte_a' cannot be resolved\n  at org.apache.spark.sql.catalyst.analysis.CTESubstitution.substituteCTE(CTESubstitution.scala:92)\n  at org.apache.spark.sql.catalyst.analysis.Analyzer$$anonfun$execute$1.apply(Analyzer.scala:189)\n```\n\nThis is a regression from SPARK-44721. The fix for that issue introduced a code path where mutual CTE references are not detected.\n\n**Workaround:** Manually inline the CTE.\n\ncc @spark-sql-team",
+      "labels": ["bug", "SQL", "optimizer"]
+    }
+  },
+
+  "group_2_kafka_consumer_rebalance": {
+    "description": "All 4 bugs relate to Kafka consumer group rebalancing causing data loss or processing delays. Same root cause: heartbeat thread stalls during partition reassignment.",
+
+    "jira_bug": {
+      "platform": "Apache JIRA (issues.apache.org/jira)",
+      "project": "KAFKA",
+      "summary": "KafkaConsumer rebalance causes duplicate message processing during cooperative sticky assignment",
+      "description": "When using CooperativeStickyAssignor, a rebalance triggered by a new consumer joining the group causes the existing consumers to re-process messages that were already committed.\n\nReproduction:\n1. Start 3 consumers in a group with CooperativeStickyAssignor\n2. Produce 10,000 messages to a 6-partition topic\n3. Start a 4th consumer\n4. Observe that ~200 messages are processed twice\n\nRoot cause analysis:\nThe heartbeat thread is blocked during the cooperative rebalance protocol's PREPARE_FOR_REBALANCE phase. During this window, the consumer's offset commits are delayed, and when partitions are revoked and reassigned, the new consumer starts from the last committed offset — which is behind the actual processing position.\n\nThread dump during the stall:\n```\n\"heartbeat-thread\" #22 daemon prio=5\n  BLOCKED on org.apache.kafka.clients.consumer.internals.ConsumerCoordinator.poll\n  at o.a.k.clients.consumer.internals.AbstractCoordinator$HeartbeatThread.run(AbstractCoordinator.java:1312)\n```\n\nExpected: Cooperative rebalance should not cause duplicate processing.\nAffected: 3.6.x, 3.7.0",
+      "priority": "High",
+      "component": "consumer",
+      "labels": ["consumer", "rebalance", "data-loss"]
+    },
+
+    "github_bug": {
+      "platform": "GitHub (apache/kafka)",
+      "title": "Consumer group heartbeat timeout during rebalance causes partition data gap",
+      "body": "## Description\n\nWhen a Kafka consumer group undergoes rebalancing, the heartbeat thread's session timeout (default 45s) can expire during slow partition assignment. This causes the coordinator to assume the consumer is dead and triggers ANOTHER rebalance — creating a cascade.\n\n## Symptoms\n- Consumer logs show: `Member [consumer-1] sending LeaveGroup request due to session timeout`\n- Processing throughput drops to zero for 30-90 seconds\n- Some partitions have a data gap (messages produced during rebalance are delayed)\n\n## Environment\n- Kafka 3.7.0\n- 12-partition topic\n- Consumer group with 6 members\n- `session.timeout.ms=45000`\n- `heartbeat.interval.ms=3000`\n\n## Logs\n```\n[2026-06-01 14:22:33] WARN ConsumerCoordinator - [Consumer clientId=consumer-1] Heartbeat thread has missed 15 heartbeats\n[2026-06-01 14:22:33] WARN AbstractCoordinator - [Consumer clientId=consumer-1] Member consumer-1 sending LeaveGroup\n[2026-06-01 14:22:34] INFO ConsumerCoordinator - [Consumer clientId=consumer-1] Revoke previously assigned partitions\n```\n\nPossibly related: KAFKA-15892",
+      "labels": ["bug", "consumer", "rebalance"]
+    },
+
+    "bugzilla_bug": {
+      "platform": "Bugzilla",
+      "product": "TestProject",
+      "component": "Messaging",
+      "summary": "Kafka consumer heartbeat stall during partition reassignment blocks processing pipeline",
+      "description": "Our Kafka-based event processing pipeline experiences a complete stall when a consumer instance is restarted.\n\nThe heartbeat thread becomes blocked waiting on ConsumerCoordinator.poll(), preventing any message processing for up to 2 minutes.\n\nSteps to Reproduce:\n1. Run a consumer group with 4 members\n2. Kill one consumer process\n3. Observe the remaining 3 consumers stall for 60-120 seconds\n4. Check thread dump — heartbeat thread is BLOCKED\n\nThread dump:\n```\n\"heartbeat-thread\" BLOCKED\n  at kafka.consumer.internals.ConsumerCoordinator.poll()\n  at kafka.consumer.internals.AbstractCoordinator$HeartbeatThread.run()\n```\n\nImpact: Payment processing delayed by 2 minutes during each deployment.\n\nSee also: KAFKA-15892",
+      "priority": "P1",
+      "severity": "major"
+    },
+
+    "jira_bug_2": {
+      "platform": "Apache JIRA (issues.apache.org/jira)",
+      "project": "KAFKA",
+      "summary": "ConsumerCoordinator.poll deadlock with cooperative rebalance during rolling restart",
+      "description": "During a rolling restart of consumers using CooperativeStickyAssignor, a deadlock occurs between the heartbeat thread and the main consumer thread.\n\nThe main thread holds the consumer lock and waits for the coordinator response, while the heartbeat thread needs the same lock to send heartbeats.\n\nResult: Consumer becomes unresponsive, session times out, and the coordinator marks it dead.\n\nStack trace:\n```\nFound one Java-level deadlock:\n\"main-consumer-thread\":\n  waiting to lock monitor 0x00007f... (object 0x00000..., ConsumerCoordinator)\n  which is held by \"heartbeat-thread\"\n\"heartbeat-thread\":\n  waiting to lock monitor 0x00007f... (object 0x00000..., ConsumerNetworkClient)  \n  which is held by \"main-consumer-thread\"\n```\n\nWorks fine with RangeAssignor. Only reproduces with CooperativeStickyAssignor.\n\nAffected: 3.5.x, 3.6.x, 3.7.0\nRelated: KAFKA-15892, KAFKA-14935",
+      "priority": "Critical",
+      "component": "consumer"
+    }
+  },
+
+  "group_3_firefox_webgl_gpu_crash": {
+    "description": "All 4 bugs relate to Firefox WebGL context loss and GPU process crashes. Same root cause: shader compilation triggers GPU driver crash on specific hardware.",
+
+    "bugzilla_bug_1": {
+      "platform": "Mozilla Bugzilla (bugzilla.mozilla.org)",
+      "product": "Firefox",
+      "component": "Graphics: WebGL",
+      "summary": "WebGL context lost event fires repeatedly on Intel UHD 630 with complex shader programs",
+      "description": "WebGL applications experience repeated CONTEXT_LOST_WEBGL events on Intel UHD 630 GPUs when fragment shaders exceed a certain complexity threshold.\n\nSteps to Reproduce:\n1. Open a WebGL application using complex fragment shaders (e.g., Three.js with PBR materials)\n2. Render a scene with > 50 draw calls\n3. After 30-60 seconds, WebGL context is lost\n4. Context restore succeeds but is lost again within 10 seconds\n\nExpected: WebGL context should remain stable\nActual: Repeated context loss/restore cycle\n\nSystem Info:\n- Firefox 125.0\n- Windows 10 22H2\n- Intel UHD 630 driver 31.0.101.4900\n- GPU Process crash ID: bp-a1b2c3d4-e5f6-7890\n\nNote: Works fine on NVIDIA GPUs and in Chrome.\n\nCrash signature: [@ mozilla::gl::GLContext::fLinkProgram]\n\nRelated: Bug 1834567, Bug 1823456",
+      "priority": "P2",
+      "severity": "major",
+      "keywords": ["webgl", "gpu-crash", "intel"]
+    },
+
+    "bugzilla_bug_2": {
+      "platform": "Mozilla Bugzilla (bugzilla.mozilla.org)",
+      "product": "Firefox",
+      "component": "Graphics: WebGL",
+      "summary": "GPU process crash in shader compilation causes tab crash on WebGL-heavy pages",
+      "description": "Firefox GPU process crashes when compiling GLSL shaders that use certain combinations of texture sampling and branching.\n\nCrash report: bp-f1e2d3c4-b5a6-9870\n\nThe crash occurs in the GPU process, which then kills the tab rendering the WebGL content.\n\nMOZ_CRASH Reason: GPU process crash\nCrash Address: 0x7fff12345678\n\nStack:\n```\nmozilla::gl::GLContext::fCompileShader(GLuint)\nmozilla::gl::GLContext::fLinkProgram(GLuint)\nmozilla::WebGLContext::LinkProgram(WebGLProgram&)\n```\n\nReproduces on:\n- Intel UHD 620/630\n- AMD Radeon RX 580 (occasionally)\n- Does NOT reproduce on NVIDIA\n\nWorkaround: Set `webgl.disabled=true` or use `layers.gpu-process.enabled=false`\n\nSee also: Bug 1834567",
+      "priority": "P1",
+      "severity": "critical"
+    },
+
+    "github_bug": {
+      "platform": "GitHub (relevant repo, e.g., a test repo you own)",
+      "title": "Firefox WebGL fLinkProgram crash causes dashboard rendering failure",
+      "body": "## Bug Report\n\nOur analytics dashboard using Three.js crashes exclusively on Firefox when rendering GPU-intensive visualizations.\n\n**Environment:**\n- Firefox 125.0\n- Three.js 0.162\n- Intel UHD 630\n\n**Error in console:**\n```\nWARNING: WebGL: Context was lost.\nERROR: WebGL: Context restore failed after 3 attempts.\n```\n\n**Browser crash log reference:**\nFirefox crash signature: `mozilla::gl::GLContext::fLinkProgram`\n\n**Workaround:** Reducing shader complexity or disabling PBR materials prevents the crash.\n\n**Suspected root cause:** Firefox's ANGLE shader translation on Intel GPUs generates invalid intermediate code that crashes the driver.\n\nRelated Firefox bug: https://bugzilla.mozilla.org/show_bug.cgi?id=1834567",
+      "labels": ["bug", "firefox", "webgl", "GPU"]
+    },
+
+    "jira_bug": {
+      "platform": "JIRA (any Jira instance you control)",
+      "project": "TESTPROJ",
+      "summary": "WebGL context lost on Firefox with fLinkProgram crash — Intel GPU driver incompatibility",
+      "description": "Multiple customer reports of Firefox crashing when accessing our WebGL-powered data visualization module.\n\nAll affected users have Intel UHD 620 or 630 GPUs.\n\nThe crash signature from Firefox crash reports is consistently:\n```\nmozilla::gl::GLContext::fLinkProgram\nmozilla::WebGLContext::LinkProgram\n```\n\nWe've traced this to a shader that uses:\n- gl_FragCoord with conditional branching\n- Multiple texture2D calls in a loop\n- Mediump float precision\n\nFirefox's ANGLE backend generates HLSL that triggers an Intel driver bug.\n\nImpact: 200+ enterprise users unable to use visualization features on Firefox.\n\nSee also: https://bugzilla.mozilla.org/show_bug.cgi?id=1834567\nWorkaround: Use Chrome or disable hardware acceleration.",
+      "priority": "High",
+      "component": "Visualization"
+    }
+  }
+}

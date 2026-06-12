@@ -81,10 +81,10 @@ class CrossSystemFetchAgent(BaseAgent):
                 "title":           jira_id,
                 "description":     "",
                 "url":             url,
-                "relevance_score": 1.0,
-                "similarity_score": 1.0,
-                "similarity_label":  "Direct Reference",
-                "similarity_reason": "Explicitly referenced in ticket text",
+                "relevance_score": 0.6,
+                "similarity_score": 0.6,
+                "similarity_label":  "Referenced",
+                "similarity_reason": "Referenced in ticket text (unverified)",
             })
         for gh_id in backlinks["github"]:
             url = (f"https://github.com/{github_repo}/issues/{gh_id}"
@@ -96,10 +96,10 @@ class CrossSystemFetchAgent(BaseAgent):
                 "title":           f"GitHub #{gh_id}",
                 "description":     "",
                 "url":             url,
-                "relevance_score": 1.0,
-                "similarity_score": 1.0,
-                "similarity_label":  "Direct Reference",
-                "similarity_reason": "Explicitly referenced in ticket text",
+                "relevance_score": 0.6,
+                "similarity_score": 0.6,
+                "similarity_label":  "Referenced",
+                "similarity_reason": "Referenced in ticket text (unverified)",
             })
         for bz_id in backlinks["bugzilla"]:
             url = (f"{bugzilla_base}/show_bug.cgi?id={bz_id}"
@@ -111,10 +111,10 @@ class CrossSystemFetchAgent(BaseAgent):
                 "title":           f"BZ-{bz_id}",
                 "description":     "",
                 "url":             url,
-                "relevance_score": 1.0,
-                "similarity_score": 1.0,
-                "similarity_label":  "Direct Reference",
-                "similarity_reason": "Explicitly referenced in ticket text",
+                "relevance_score": 0.6,
+                "similarity_score": 0.6,
+                "similarity_label":  "Referenced",
+                "similarity_reason": "Referenced in ticket text (unverified)",
             })
         log.info("CrossSystem backlinks found",
                  jira=len(backlinks["jira"]),
@@ -133,17 +133,17 @@ class CrossSystemFetchAgent(BaseAgent):
                 source_ticket, cache_candidates)
             candidates.extend(scored)
 
-        # LEVEL 3: Live API search — only if < 2 unique candidates
-        total_unique = len({c.get("id", "") for c in candidates if c.get("id")})
-        sources_queried = []
-        if total_unique < 2:
-            log.warning(
-                "Levels 1+2 returned fewer than 2 candidates. "
-                "Falling back to live API search.")
-            live_results, sources_queried = await self._live_api_search(
-                primary, primary_source, context,
-                all_connectors=all_connectors)
-            candidates.extend(live_results)
+        # LEVEL 3: Live API search — always run for external systems
+        # to ensure cross-system discovery finds bugs from other
+        # connected repos, not just the primary source.
+        log.info(
+            "CrossSystem: running live API search against "
+            "external connected systems",
+            level2_candidates=len(candidates))
+        live_results, sources_queried = await self._live_api_search(
+            primary, primary_source, context,
+            all_connectors=all_connectors)
+        candidates.extend(live_results)
 
         # Normalize ALL candidates, drop self-matches, and deduplicate by
         # normalized source + ticket id before Panel 2 sees the payload.
@@ -519,49 +519,77 @@ class CrossSystemFetchAgent(BaseAgent):
             log.warning("CrossSystem: no targets found")
             return [], []
 
-        # Step C: Parallel search with platform-specific queries
+        # Step C: Multi-query parallel search
+        # Each connector gets up to 3 diverse queries for better coverage:
+        #   1. Specific (LLM-generated technical terms)
+        #   2. Component + error type (direct from bug fields)
+        #   3. Description keywords (extracted from description text)
+        desc_query = self._extract_description_keywords(
+            primary.get("description", ""),
+            primary.get("title", ""))
+
         async def search_one(connector):
             ctype     = (connector.system_type or "").lower()
             source_id = connector.source_id
-            is_sister = (self._get_family(source_id) ==
-                         self._get_family(primary_source))
 
+            # Build query list: all connectors get the specific query
+            # (not just sisters), plus component+error and description
+            queries = []
+
+            # Query 1: Platform-specific technical query
             if "jira" in ctype:
-                query = (query_map.get("jira_query", "")
-                         if is_sister
-                         else query_map.get("broad_query", ""))
+                q = query_map.get("jira_query", "")
             elif "github" in ctype:
-                query = (query_map.get("github_query", "")
-                         if is_sister
-                         else query_map.get("broad_query", ""))
+                q = query_map.get("github_query", "")
             elif "bugzilla" in ctype:
-                query = (query_map.get("bugzilla_query", "")
-                         if is_sister
-                         else query_map.get("broad_query", ""))
+                q = query_map.get("bugzilla_query", "")
             else:
-                query = query_map.get("broad_query", "")
+                q = query_map.get("broad_query", "")
+            if q:
+                queries.append(q)
 
-            if not query:
+            # Query 2: Component + error type (no LLM needed)
+            comp_err = query_map.get("component_error_query", "")
+            if comp_err and comp_err not in queries:
+                queries.append(comp_err)
+
+            # Query 3: Description keywords
+            if desc_query and desc_query not in queries:
+                queries.append(desc_query)
+
+            if not queries:
                 return source_id, []
 
-            try:
-                results = await asyncio.wait_for(
-                    connector.search(query, max_results=8),
-                    timeout=20.0)
-                log.info("CrossSystem result",
-                         source=source_id,
-                         query=query,
-                         sister=is_sister,
-                         count=len(results))
-                return source_id, results
-            except asyncio.TimeoutError:
-                log.warning("CrossSystem timeout",
-                            source=source_id)
-                return source_id, []
-            except Exception as e:
-                log.warning("CrossSystem error",
-                            source=source_id, error=str(e))
-                return source_id, []
+            # Run each query and merge results (dedupe by ticket_id)
+            all_results = []
+            seen_tids = set()
+            for query in queries[:3]:
+                try:
+                    results = await asyncio.wait_for(
+                        connector.search(query, max_results=5),
+                        timeout=20.0)
+                    for r in results:
+                        tid = getattr(r, "ticket_id", "") or ""
+                        if tid not in seen_tids:
+                            seen_tids.add(tid)
+                            all_results.append(r)
+                    log.info("CrossSystem search",
+                             source=source_id,
+                             query=query,
+                             count=len(results))
+                except asyncio.TimeoutError:
+                    log.warning("CrossSystem timeout",
+                                source=source_id, query=query)
+                except Exception as e:
+                    log.warning("CrossSystem error",
+                                source=source_id,
+                                query=query, error=str(e))
+
+            log.info("CrossSystem multi-query results",
+                     source=source_id,
+                     queries_used=len(queries),
+                     total_unique=len(all_results))
+            return source_id, all_results
 
         gathered = await asyncio.gather(
             *[search_one(c) for c in targets])
@@ -574,9 +602,13 @@ class CrossSystemFetchAgent(BaseAgent):
                 d = dataclasses.asdict(t)
                 d["id"] = d.get("ticket_id", "")
                 live_candidates.append(d)
+            log.info("CrossSystem external source results",
+                     source=source_id,
+                     count=len(tickets))
 
         log.info("CrossSystem candidates",
-                 total=len(live_candidates))
+                 total=len(live_candidates),
+                 sources=sources_queried)
 
         # Step D: Add co-references as direct hits (score=1.0)
         direct_hits = await self._fetch_co_references(
@@ -623,16 +655,27 @@ class CrossSystemFetchAgent(BaseAgent):
         log.info("CrossSystem candidates after fallback",
                  total=len(live_candidates))
 
-        # Step E: Batch score all candidates in ONE LLM call
+        # Step E: Batch score ALL candidates (including co-references)
+        # in ONE LLM call — co-refs should NOT get a free 1.0 score.
+        all_to_score = live_candidates + direct_hits
         scored = await self._batch_score(
-            primary, live_candidates, groq_api_key, groq_model)
+            primary, all_to_score, groq_api_key, groq_model)
         for d in scored:
             d["id"] = d.get("ticket_id", "")
+            # Give a small relevance boost to co-references since
+            # they were explicitly mentioned in the bug text
+            if d.get("from_co_reference"):
+                raw_score = d.get("similarity_score", 0)
+                d["similarity_score"] = round(
+                    min(1.0, raw_score + 0.1), 2)
+                if d.get("similarity_reason"):
+                    d["similarity_reason"] += (
+                        " (explicitly referenced in bug text)")
 
-        # Merge direct hits first then scored
+        # Deduplicate
         seen_ids = set()
         final    = []
-        for item in direct_hits + scored:
+        for item in scored:
             tid = item.get("ticket_id", "") or item.get("id", "")
             if tid not in seen_ids:
                 seen_ids.add(tid)
@@ -664,6 +707,7 @@ Bug:
 Title: {title}
 Component: {component}
 Error: {error_excerpt}
+Description snippet: {description}
 
 Rules:
 - Use the exact technical vocabulary developers use in
@@ -674,29 +718,33 @@ Rules:
   "stylelintrc", "pom.xml", "build.gradle"
 - Code issues use: class names, method names, exception types
 - Strip ALL line numbers, hex addresses, thread IDs
-- 1-2 words maximum per query
+- 2-4 words per query for better precision
 - NEVER use: "management", "configuration", "implementation",
   "issue", "problem", "bug", "error", "fix", "missing"
 
 Examples:
 Title "Add license header to eslintrc.js"
-  → specific: "eslintrc license"
-  → broad: "apache-rat license"
+  → specific: "eslintrc license header"
+  → broad: "apache-rat license check"
+  → component_error: "eslintrc rat"
 
 Title "NullPointerException in StorageController.allocate"
-  → specific: "StorageController NPE"
-  → broad: "storage allocation concurrent"
+  → specific: "StorageController allocate NPE"
+  → broad: "storage allocation NullPointer"
+  → component_error: "StorageController NullPointerException"
 
 Title "Kafka consumer rebalancing timeout"
-  → specific: "KafkaConsumer rebalancing"
-  → broad: "consumer group heartbeat"
+  → specific: "KafkaConsumer rebalancing timeout"
+  → broad: "consumer group heartbeat rebalance"
+  → component_error: "consumer rebalancing"
 
 Output JSON only:
 {{
-  "jira_query":     "specific 1-2 developer terms",
-  "github_query":   "specific 1-2 developer terms",
-  "bugzilla_query": "specific 1-2 developer terms",
-  "broad_query":    "broad 1-2 ecosystem terms"
+  "jira_query":           "specific 2-4 developer terms",
+  "github_query":         "specific 2-4 developer terms",
+  "bugzilla_query":       "specific 2-4 developer terms",
+  "broad_query":          "broad 2-4 ecosystem terms",
+  "component_error_query": "component + error/symptom 2-3 words"
 }}"""
 
         try:
@@ -716,13 +764,15 @@ Output JSON only:
                        "crash", "null", ""}
             result  = {
                 "jira_query":     str(parsed.get(
-                    "jira_query", "")).strip()[:60],
+                    "jira_query", "")).strip()[:80],
                 "github_query":   str(parsed.get(
-                    "github_query", "")).strip()[:60],
+                    "github_query", "")).strip()[:80],
                 "bugzilla_query": str(parsed.get(
-                    "bugzilla_query", "")).strip()[:60],
+                    "bugzilla_query", "")).strip()[:80],
                 "broad_query":    str(parsed.get(
-                    "broad_query", "")).strip()[:60],
+                    "broad_query", "")).strip()[:80],
+                "component_error_query": str(parsed.get(
+                    "component_error_query", "")).strip()[:80],
             }
 
             for key in ["jira_query", "github_query",
@@ -735,13 +785,19 @@ Output JSON only:
             if not result["broad_query"]:
                 result["broad_query"] = (component or
                                           fallback["jira_query"])
+            # Deterministic component+error query as fallback
+            if not result["component_error_query"] and component:
+                result["component_error_query"] = component
             return result
 
         except Exception as e:
             log.warning("Query generation failed", error=str(e))
-            return {**fallback,
-                    "broad_query": component or
-                    fallback["jira_query"]}
+            fb = {**fallback,
+                  "broad_query": component or
+                  fallback["jira_query"]}
+            if component:
+                fb["component_error_query"] = component
+            return fb
 
     def _deterministic_fallback(self,
                                  title: str,
@@ -819,18 +875,26 @@ Output JSON only:
 
     # ── Connector selection ───────────────────────────────────────
     def _get_family(self, source_id: str) -> str:
+        """Derive a project 'family' name from a source_id by stripping
+        known system-type suffixes. E.g. 'my-project-jira' and
+        'my-project-github' both resolve to 'my-project'."""
         s = source_id.lower()
-        for p in ["apache-", "mozilla-", "microsoft-",
-                  "kubernetes-", "facebook-", "nodejs-"]:
-            s = s.replace(p, "")
-        for sx in ["-jira", "-github", "-bugzilla",
-                   "-gitlab"]:
-            s = s.replace(sx, "")
-        return s.strip("-")
+        for sx in ["-jira", "-github", "-bugzilla", "-gitlab",
+                   "_jira", "_github", "_bugzilla", "_gitlab",
+                   "-jira-cloud", "-jira-apache",
+                   "_jira_cloud", "_jira_apache"]:
+            if s.endswith(sx):
+                s = s[:len(s) - len(sx)]
+                break
+        return s.strip("-_")
 
     def _select_targets(self,
                         all_connectors: list,
                         primary_source_id: str) -> list:
+        """Select ALL external bug-source connectors for cross-system
+        search. Connectors belonging to the same project family as
+        the primary source are sorted first (sisters), followed by
+        all other external systems."""
         candidates = [
             c for c in all_connectors
             if c.source_id != primary_source_id
@@ -839,27 +903,18 @@ Output JSON only:
         if not candidates:
             return []
 
-        pf     = self._get_family(primary_source_id)
-        apache = {"spark", "kafka", "hadoop", "hive",
-                  "flink", "hbase", "cassandra",
-                  "airflow", "zookeeper"}
-
-        sisters = [c for c in candidates
-                   if self._get_family(c.source_id) == pf]
-        related = [c for c in candidates
-                   if self._get_family(c.source_id) in apache
-                   and self._get_family(c.source_id) != pf
-                   and c not in sisters]
-
-        seen   = {c.system_type for c in sisters + related}
-        others = []
-        for c in candidates:
-            if (c not in sisters and c not in related
-                    and c.system_type not in seen):
-                others.append(c)
-                seen.add(c.system_type)
-
-        return (sisters + related[:3] + others[:2])[:6]
+        pf = self._get_family(primary_source_id)
+        # Sort by family affinity: sisters first, then others
+        # Within each group, sort alphabetically for determinism
+        candidates.sort(key=lambda c: (
+            0 if self._get_family(c.source_id) == pf else 1,
+            c.source_id,
+        ))
+        log.info("CrossSystem target selection",
+                 primary_family=pf,
+                 total_external=len(candidates),
+                 targets=[c.source_id for c in candidates[:12]])
+        return candidates[:12]
 
     # ── Backlink extraction (pure text, no network) ───────────────
     def _extract_backlinks(self,
@@ -900,17 +955,21 @@ Output JSON only:
                         timeout=8.0)
                     if t:
                         td = dataclasses.asdict(t)
-                        td["similarity_score"]    = 1.0
-                        td["similarity_label"]    = "Identical"
+                        # Mark as co-reference for scoring boost,
+                        # but do NOT auto-assign 1.0 — let AI
+                        # scoring validate actual relevance.
+                        td["from_co_reference"] = True
+                        td["similarity_score"]    = 0.6
+                        td["similarity_label"]    = "Referenced"
                         td["similarity_reason"]   = (
-                            "Explicit cross-reference "
-                            "in bug text")
+                            "Cross-reference found in bug text")
                         td["similarity_matching_fields"] = [
                             "direct_reference"]
                         hits.append(td)
-                        log.info("CrossSystem direct hit",
+                        log.info("CrossSystem co-ref found",
                                  ref=ref["raw_id"],
-                                 source=c.source_id)
+                                 source=c.source_id,
+                                 title=(td.get("title") or "")[:60])
                         break
                 except Exception:
                     pass
@@ -954,9 +1013,9 @@ Output JSON only:
 
         prompt = (
             f"Score how related each candidate is to the "
-            f"primary bug.\n"
-            f"Focus on: same root cause, same component, "
-            f"same exception, same code path.\n\n"
+            f"primary bug. Be STRICT — only bugs with the same "
+            f"root cause or same error in the same code area "
+            f"should score high.\n\n"
             f"Primary:\n{primary_str}\n\n"
             f"Candidates:{cands_str}\n\n"
             f"Return JSON object with key 'results' as array.\n"
@@ -965,9 +1024,21 @@ Output JSON only:
             f"similarity_label "
             f"(Identical/Very Similar/Similar/Possible/Unrelated),\n"
             f"similarity_reason (one sentence), "
-            f"similarity_matching_fields (array).\n"
-            f"0.9+ same root cause, 0.7 same component+error, "
-            f"0.5 same component, 0.3 related, 0.1 unrelated.\n"
+            f"similarity_matching_fields (array).\n\n"
+            f"Strict scoring calibration:\n"
+            f"0.9+ = same root cause AND same error/exception "
+            f"in same code path\n"
+            f"0.7-0.89 = same error type in the same component, "
+            f"likely same root cause\n"
+            f"0.5-0.69 = related symptoms or same failure mode "
+            f"but may differ in root cause\n"
+            f"0.3-0.49 = same area/component but clearly "
+            f"different issue\n"
+            f"0.0-0.29 = unrelated, different component or "
+            f"different type of issue entirely\n\n"
+            f"IMPORTANT: Two bugs sharing ONLY a component name "
+            f"but with different errors/symptoms MUST score "
+            f"below 0.5. Sharing a component is NOT enough.\n"
             f"Return JSON only."
         )
 
@@ -1022,8 +1093,62 @@ Output JSON only:
                 c["similarity_matching_fields"] = []
 
         result = [c for c in candidates[:12]
-                  if c.get("similarity_score", 0) >= 0.50]
+                  if c.get("similarity_score", 0) >= 0.55]
         result.sort(
             key=lambda x: x.get("similarity_score", 0),
             reverse=True)
+        return result
+
+    # ── Description keyword extraction ──────────────────────────
+    def _extract_description_keywords(
+            self, description: str, title: str) -> str:
+        """Extract 3-4 meaningful technical keywords from the
+        description to use as a complementary search query.
+        Prioritizes exception types, class names, file paths,
+        and technical terms."""
+        import re
+        text = f"{title} {description[:500]}"
+
+        # Priority 1: Exception/Error class names
+        exceptions = re.findall(
+            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)*(?:Exception|Error|'
+            r'Fault|Failure))\b', text)
+
+        # Priority 2: CamelCase identifiers (class/method names)
+        camel = re.findall(
+            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', text)
+        # Remove duplicates with exceptions
+        camel = [c for c in camel if c not in exceptions]
+
+        # Priority 3: File paths / config names
+        files = re.findall(
+            r'\b([\w.-]+\.(?:java|py|js|ts|xml|yml|yaml|conf|'
+            r'properties|json|gradle|scala))\b', text)
+
+        # Priority 4: Long technical words (>6 chars, not stop words)
+        tech_words = [
+            w.strip(".,()[]'\"") for w in text.split()
+            if len(w.strip(".,()[]'\"")) > 6
+            and w.lower().strip(".,()[]'\"") not in STOP_WORDS
+            and not w[0].isdigit()
+        ]
+
+        # Combine: take best from each category
+        keywords = []
+        seen = set()
+        for pool in [exceptions[:2], camel[:2],
+                     files[:1], tech_words[:3]]:
+            for kw in pool:
+                kw_lower = kw.lower()
+                if kw_lower not in seen and len(kw) > 2:
+                    seen.add(kw_lower)
+                    keywords.append(kw)
+                if len(keywords) >= 4:
+                    break
+            if len(keywords) >= 4:
+                break
+
+        result = " ".join(keywords[:4])
+        log.info("CrossSystem description keywords",
+                 keywords=result)
         return result

@@ -296,12 +296,23 @@ export default function SettingsPage() {
   }
 
   const handleRemove = async (sourceId) => {
-    if (!window.confirm('Remove this connection?')) return
+    if (!window.confirm('Disable this connection?')) return
     try {
       await removeConnection(sourceId)
       fetchConnections()
+      showToast('Connection disabled')
     } catch (err) {
-      alert('Failed to remove: ' + (err.response?.data?.detail || err.message))
+      alert('Failed to disable: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
+  const handleToggleEnabled = async (sourceId, currentlyEnabled) => {
+    try {
+      await updateConnection(sourceId, { enabled: !currentlyEnabled })
+      fetchConnections()
+      showToast(currentlyEnabled ? 'Connection disabled' : 'Connection enabled')
+    } catch (err) {
+      alert('Failed to update: ' + (err.response?.data?.detail || err.message))
     }
   }
 
@@ -494,7 +505,10 @@ export default function SettingsPage() {
               const isLoading = !!testing[conn.source_id]
               return (
                 <div key={conn.source_id} style={{
-                  border: '1px solid var(--border)', borderRadius: 10, padding: 16, marginBottom: 12,
+                  border: `1px solid ${conn.enabled ? 'var(--border)' : 'var(--border)'}`, borderRadius: 10, padding: 16, marginBottom: 12,
+                  opacity: conn.enabled ? 1 : 0.55,
+                  background: conn.enabled ? 'transparent' : 'var(--bg)',
+                  transition: 'opacity 0.2s ease, background 0.2s ease',
                 }}>
                   <div style={{ display: 'flex', alignItems: 'center' }}>
                     <div style={{
@@ -508,6 +522,15 @@ export default function SettingsPage() {
                     <div style={{ flex: 1, margin: '0 16px', minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                         <span style={{ fontWeight: 700, fontSize: 14 }}>{conn.display_name}</span>
+                        {!conn.enabled && (
+                          <span style={{
+                            fontSize: 10, fontWeight: 700, padding: '1px 7px', borderRadius: 10,
+                            background: '#9AA3B522', color: '#9AA3B5',
+                            border: '1px solid #9AA3B544',
+                          }}>
+                            Disabled
+                          </span>
+                        )}
                         {conn.ticket_prefix && (
                           <span style={{
                             fontSize: 10.5, fontFamily: 'JetBrains Mono, monospace',
@@ -537,7 +560,7 @@ export default function SettingsPage() {
                       <button
                         className="btn btn-ghost btn-sm"
                         onClick={() => handleTest(conn.source_id)}
-                        disabled={isLoading}
+                        disabled={isLoading || !conn.enabled}
                       >
                         {isLoading ? '⟳ Testing…' : 'Test'}
                       </button>
@@ -549,10 +572,15 @@ export default function SettingsPage() {
                       </button>
                       <button
                         className="btn btn-sm"
-                        style={{ border: '1px solid var(--red-bd)', color: 'var(--red)', background: 'transparent' }}
-                        onClick={() => handleRemove(conn.source_id)}
+                        style={{
+                          border: `1px solid ${conn.enabled ? 'var(--red-bd)' : 'var(--teal-bd)'}`,
+                          color: conn.enabled ? 'var(--red)' : 'var(--teal)',
+                          background: conn.enabled ? 'transparent' : 'var(--teal-lt)',
+                          fontWeight: conn.enabled ? 400 : 600,
+                        }}
+                        onClick={() => handleToggleEnabled(conn.source_id, conn.enabled)}
                       >
-                        Remove
+                        {conn.enabled ? 'Disable' : 'Enable'}
                       </button>
                     </div>
                   </div>
